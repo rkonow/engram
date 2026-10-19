@@ -1,19 +1,28 @@
 //! The memory table in a Strata file: appends, hybrid search, SQL.
+//!
+//! Reads run on the caller's thread against a snapshot, any number at once.
+//! Writes go to one writer thread ([`Writer`]), which commits whatever is
+//! queued as one transaction, numbers new records in commit order, and
+//! flushes and merges between transactions. Strata publishes each version
+//! before the writer answers (`DbOptions::publish_snapshots`), so a caller
+//! reads its own writes, and a reader never waits for a write or for the
+//! index build that follows it.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc};
 
 use serde::Serialize;
 use strata::db::Db;
 use strata::query::exec::ResultSet;
 use strata::query::Params;
-use strata::storage::{DbOptions, MergePolicy};
-use strata::{Value, VectorIndexKind};
+use strata::storage::{DbOptions, MergePolicy, Snapshot};
+use strata::{Document, Value, VectorIndexKind};
 
 use crate::embed::Embedder;
-use crate::record::{entity_id, file_entity_id, links_of, schema, Draft, Kind, Link, Record, COLUMNS};
-use crate::{err, Result};
+use crate::record::{entity_id, file_entity_id, links_of, record_id, schema, Draft, Kind, Link, Record, COLUMNS};
+use crate::{err, Error, Result};
 
 /// One search result with its component scores.
 #[derive(Clone, Debug, Serialize)]
@@ -114,12 +123,11 @@ impl Default for StoreOptions {
 }
 
 pub struct Store {
-    pub db: Db,
+    pub db: Arc<Db>,
     pub embedder: Arc<dyn Embedder>,
-    next_seq: AtomicI64,
-    /// Strata takes one writer at a time and fails the others; this queues them.
-    write: Mutex<()>,
-    opts: StoreOptions,
+    writer: Arc<Writer>,
+    /// The snapshot this handle reads, if pinned (see [`Store::pinned`]).
+    snap: Option<Snapshot>,
 }
 
 impl Store {
@@ -129,14 +137,19 @@ impl Store {
         dbo.sync = opts.sync;
         dbo.memtable_max_docs = opts.flush_docs * 4;
         dbo.memtable_chunk_docs = opts.mem_chunk_docs.max(64);
+        dbo.publish_snapshots = true;
         if opts.mem_flat {
             dbo.mem_build = Some(dbo.build.clone().set("vector.index", "flat"));
         }
-        if path.exists() && Db::open(path, dbo.clone())?.schema().field("links").is_none() {
-            migrate(path, &embedder, &opts)?;
-        }
         let db = if path.exists() {
-            Db::open(path, dbo)?
+            let db = Db::open(path, dbo.clone())?;
+            if db.schema().field("links").is_some() {
+                db
+            } else {
+                drop(db);
+                migrate(path, &embedder, &opts)?;
+                Db::open(path, dbo)?
+            }
         } else {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -149,27 +162,35 @@ impl Store {
                 return Err(err(format!("{} holds {dim}-dimension vectors; the embedder {} makes {want}", path.display(), embedder.name())));
             }
         }
-        let store = Store { db, embedder, next_seq: AtomicI64::new(0), write: Mutex::new(()), opts };
-        let last = store.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1")?;
+        let last = db.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1", &Params::new())?;
         let next = last.rows.first().and_then(|r| r[0].as_i64()).map_or(1, |s| s + 1);
-        store.next_seq.store(next, Ordering::SeqCst);
-        Ok(store)
+        let db = Arc::new(db);
+        let writer = Arc::new(Writer::start(db.clone(), next, opts.flush_docs)?);
+        Ok(Store { db, embedder, writer, snap: None })
     }
 
-    /// Reserves `n` consecutive sequence numbers.
-    pub fn reserve(&self, n: usize) -> i64 {
-        self.next_seq.fetch_add(n as i64, Ordering::SeqCst)
+    /// A handle whose reads all see the current version, however much is
+    /// written meanwhile: the searches of one request agree with each other.
+    /// (Its writes go to the writer as usual; its reads do not see them.)
+    pub fn pinned(&self) -> Store {
+        Store { db: self.db.clone(), embedder: self.embedder.clone(), writer: self.writer.clone(), snap: Some(self.snapshot()) }
+    }
+
+    /// The version reads see: the pinned one, else the latest.
+    pub fn snapshot(&self) -> Snapshot {
+        self.snap.clone().unwrap_or_else(|| self.db.snapshot())
     }
 
     pub fn last_seq(&self) -> i64 {
-        self.next_seq.load(Ordering::SeqCst) - 1
+        self.writer.next_seq.load(Ordering::SeqCst) - 1
     }
 
     pub fn len(&self) -> u64 {
-        self.db.snapshot().n_live_docs()
+        self.snapshot().n_live_docs()
     }
 
-    /// Embeds and stores records whose sequence numbers are already assigned.
+    /// Embeds and stores records with the ids and sequence numbers they
+    /// have, replacing the stored ones with the same ids.
     pub fn insert(&self, records: &[Record]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -182,25 +203,14 @@ impl Store {
 
     /// Stores records with precomputed embeddings.
     pub fn insert_embedded(&self, records: &[Record], embs: Vec<Vec<f32>>) -> Result<()> {
-        let schema = self.db.schema().clone();
-        let _w = self.write.lock().unwrap();
-        let mut txn = self.db.storage().begin()?;
-        for (r, e) in records.iter().zip(embs) {
-            let mut doc = r.to_doc(e);
-            schema.fill_generated(&mut doc);
-            txn.upsert(doc)?;
-        }
-        txn.commit()?;
-        drop(_w);
-        self.maintain()?;
-        Ok(())
+        let recs = records.iter().cloned().zip(embs).map(|(rec, emb)| Pending { rec, emb, how: How::Replace }).collect();
+        self.writer.run(Op::Put(recs)).map(|_| ())
     }
 
     /// Bulk-loads records (for benchmarks and transcript back-fill).
     pub fn bulk_insert(&self, records: &[Record], embs: Vec<Vec<f32>>) -> Result<()> {
         let schema = self.db.schema().clone();
-        let _w = self.write.lock().unwrap();
-        let docs: Vec<Vec<Value>> = records
+        let docs: Vec<Document> = records
             .iter()
             .zip(embs)
             .map(|(r, e)| {
@@ -209,7 +219,10 @@ impl Store {
                 d
             })
             .collect();
-        self.db.storage().bulk_load(docs)?;
+        self.writer.run(Op::Load(docs))?;
+        if let Some(max) = records.iter().map(|r| r.seq).max() {
+            self.writer.next_seq.fetch_max(max + 1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -238,16 +251,22 @@ impl Store {
                 }
             }
         }
-        let first = self.reserve(drafts.len());
-        let mut records: Vec<Record> = drafts.into_iter().enumerate().map(|(i, d)| Record::from_draft(d, session, turn, first + i as i64, ts)).collect();
+        // The writer numbers them (and so gives their ids) in commit order.
+        let records: Vec<Record> = drafts.into_iter().map(|d| Record::from_draft(d, session, turn, 0, ts)).collect();
         let entities = self.new_entities(names, ts)?;
-        let out = records.clone();
-        records.extend(entities);
-        self.insert(&records)?;
-        Ok(out)
+        if records.is_empty() && entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let texts: Vec<String> = records.iter().chain(&entities).map(|r| r.embed_text()).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let mut embs = self.embedder.embed(&refs).into_iter();
+        let mut recs: Vec<Pending> = records.into_iter().map(|rec| Pending { rec, emb: embs.next().unwrap_or_default(), how: How::New }).collect();
+        recs.extend(entities.into_iter().map(|rec| Pending { rec, emb: embs.next().unwrap_or_default(), how: How::Entity }));
+        Ok(self.writer.run(Op::Put(recs))?.stored)
     }
 
-    /// Entity records for the names not stored yet.
+    /// Entity records for the names not stored yet (the writer checks again,
+    /// against what was stored since).
     fn new_entities(&self, names: Vec<(String, String)>, ts: i64) -> Result<Vec<Record>> {
         let mut seen = std::collections::HashSet::new();
         let names: Vec<(String, String)> = names.into_iter().filter(|(id, _)| seen.insert(id.clone())).collect();
@@ -256,42 +275,26 @@ impl Store {
         }
         let ids: Vec<String> = names.iter().map(|(id, _)| id.clone()).collect();
         let have: std::collections::HashSet<String> = self.get(&ids)?.into_iter().map(|r| r.id).collect();
-        let new: Vec<(String, String)> = names.into_iter().filter(|(id, _)| !have.contains(id)).collect();
-        let first = self.reserve(new.len());
-        Ok(new
+        Ok(names
             .into_iter()
-            .enumerate()
-            .map(|(i, (id, name))| {
-                let mut r = Record::from_draft(Draft::new(Kind::Entity, name), "-", 0, first + i as i64, ts);
+            .filter(|(id, _)| !have.contains(id))
+            .map(|(id, name)| {
+                let mut r = Record::from_draft(Draft::new(Kind::Entity, name), "-", 0, 0, ts);
                 r.id = id;
                 r
             })
             .collect())
     }
 
-    /// Builds the current snapshot's in-memory segments and readers now, so
-    /// the next query does not pay for it.
+    /// Opens the current snapshot's segment readers now, so the next query
+    /// does not pay for it.
     pub fn warm(&self) {
-        let snap = self.db.snapshot();
-        let _ = self.db.readers(&snap);
-    }
-
-    /// Flushes the memtable when it is large, then merges small segments.
-    pub fn maintain(&self) -> Result<()> {
-        let stats = self.db.storage().file_stats();
-        if stats.memtable_docs >= self.opts.flush_docs {
-            let _w = self.write.lock().unwrap();
-            self.db.storage().flush()?;
-            self.db.storage().merge(&MergePolicy::default())?;
-        }
-        Ok(())
+        let _ = self.db.readers(&self.snapshot());
     }
 
     /// Writes everything to segments (on shutdown).
     pub fn flush(&self) -> Result<()> {
-        let _w = self.write.lock().unwrap();
-        self.db.storage().flush()?;
-        Ok(())
+        self.writer.run(Op::Flush).map(|_| ())
     }
 
     /// Changes a record's tag (e.g. planned work that is now done).
@@ -304,20 +307,16 @@ impl Store {
 
     /// Deletes a record.
     pub fn delete(&self, id: &str) -> Result<bool> {
-        let _w = self.write.lock().unwrap();
-        let mut txn = self.db.storage().begin()?;
-        let found = txn.delete(&Value::Str(id.to_string()))?;
-        txn.commit()?;
-        Ok(found)
+        Ok(self.writer.run(Op::Delete(id.to_string()))?.found)
     }
 
     /// Runs SQL against the memory table.
     pub fn query(&self, sql: &str) -> Result<ResultSet> {
-        Ok(self.db.query(sql, &Params::new())?)
+        self.query_with(sql, &Params::new())
     }
 
     pub fn query_with(&self, sql: &str, params: &Params) -> Result<ResultSet> {
-        Ok(self.db.query(sql, params)?)
+        Ok(self.db.query_at(&self.snapshot(), sql, params, &self.db.exec)?)
     }
 
     /// Records by id (any order).
@@ -387,8 +386,7 @@ impl Store {
     /// Inverse document frequency of each analysed query term over `body`,
     /// from the segments' term dictionaries (deleted records still count).
     pub fn idf(&self, terms: &[String]) -> Result<Vec<f64>> {
-        let snap = self.db.snapshot();
-        let readers = self.db.readers(&snap)?;
+        let readers = self.db.readers(&self.snapshot())?;
         let field = self.db.schema().field_index("body").ok_or_else(|| err("no body field"))?;
         let mut n = 0u64;
         let mut df = vec![0u64; terms.len()];
@@ -403,6 +401,184 @@ impl Store {
         let n = n.max(1) as f64;
         Ok(df.into_iter().map(|d| (1.0 + (n - d as f64 + 0.5) / (d as f64 + 0.5)).ln()).collect())
     }
+}
+
+/// A record for the writer to store.
+struct Pending {
+    rec: Record,
+    emb: Vec<f32>,
+    how: How,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum How {
+    /// Takes the next sequence number, and the id that goes with it.
+    New,
+    /// An entity: takes the next sequence number, unless its id is stored.
+    Entity,
+    /// Replaces the stored record with its id.
+    Replace,
+}
+
+enum Op {
+    Put(Vec<Pending>),
+    Delete(String),
+    Load(Vec<Document>),
+    Flush,
+}
+
+/// What an operation gives back.
+#[derive(Default)]
+struct Done {
+    /// The new records it stored, numbered.
+    stored: Vec<Record>,
+    /// A delete found its record.
+    found: bool,
+}
+
+type Job = (Op, mpsc::Sender<Result<Done>>);
+
+/// Jobs that may share one transaction.
+const MAX_GROUP: usize = 256;
+
+/// The single writer: a thread that makes every write to the store.
+struct Writer {
+    jobs: Option<mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// The next sequence number, advanced by the writer at each commit.
+    next_seq: Arc<AtomicI64>,
+}
+
+impl Writer {
+    fn start(db: Arc<Db>, next: i64, flush_docs: usize) -> Result<Writer> {
+        let next_seq = Arc::new(AtomicI64::new(next));
+        let (tx, rx) = mpsc::channel();
+        let seq = next_seq.clone();
+        let thread = std::thread::Builder::new().name("engram-writer".into()).spawn(move || write_loop(&db, &rx, &seq, flush_docs))?;
+        Ok(Writer { jobs: Some(tx), thread: Some(thread), next_seq })
+    }
+
+    /// Queues an operation and waits until it is committed and readers see it.
+    fn run(&self, op: Op) -> Result<Done> {
+        let stopped = || err("the store's writer has stopped");
+        let (tx, rx) = mpsc::channel();
+        self.jobs.as_ref().ok_or_else(stopped)?.send((op, tx)).map_err(|_| stopped())?;
+        rx.recv().map_err(|_| stopped())?
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // The thread finishes what is queued, then ends.
+        drop(self.jobs.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The writer thread. Whatever is queued when it is free is committed
+/// together (one WAL sync for all of it); between transactions a large
+/// memtable becomes a segment and small segments merge.
+fn write_loop(db: &Db, jobs: &mpsc::Receiver<Job>, next_seq: &AtomicI64, flush_docs: usize) {
+    while let Ok(first) = jobs.recv() {
+        let mut group = Vec::new();
+        for (op, reply) in std::iter::once(first).chain(std::iter::from_fn(|| jobs.try_recv().ok()).take(MAX_GROUP - 1)) {
+            let r = match op {
+                Op::Put(_) | Op::Delete(_) => {
+                    group.push((op, reply));
+                    continue;
+                }
+                Op::Load(docs) => {
+                    commit_group(db, next_seq, std::mem::take(&mut group));
+                    db.storage().bulk_load(docs)
+                }
+                Op::Flush => {
+                    commit_group(db, next_seq, std::mem::take(&mut group));
+                    db.storage().flush()
+                }
+            };
+            let _ = reply.send(r.map(|_| Done::default()).map_err(Error::from));
+        }
+        commit_group(db, next_seq, group);
+        if db.storage().file_stats().memtable_docs >= flush_docs {
+            if let Err(e) = db.storage().flush().and_then(|_| db.storage().merge(&MergePolicy::default()).map(|_| ())) {
+                eprintln!("engram: flushing the memtable: {e}");
+            }
+        }
+    }
+}
+
+/// Commits puts and deletes as one transaction and answers each. If an
+/// operation is refused, nothing is committed and each job is tried on its
+/// own, so that it fails only its own caller.
+fn commit_group(db: &Db, next_seq: &AtomicI64, mut group: Vec<Job>) {
+    if group.is_empty() {
+        return;
+    }
+    match apply(db, next_seq, &mut group) {
+        Ok(done) => {
+            for ((_, reply), d) in group.into_iter().zip(done) {
+                let _ = reply.send(Ok(d));
+            }
+        }
+        Err((e, committed)) if committed || group.len() == 1 => {
+            for (_, reply) in group {
+                let _ = reply.send(Err(err(e.0.clone())));
+            }
+        }
+        Err(_) => {
+            for job in group {
+                commit_group(db, next_seq, vec![job]);
+            }
+        }
+    }
+}
+
+/// Applies a group in one transaction. An error says whether the commit
+/// was reached (then it may have happened, and the group is not retried).
+fn apply(db: &Db, next_seq: &AtomicI64, group: &mut [Job]) -> std::result::Result<Vec<Done>, (Error, bool)> {
+    let refused = |e: strata::Error| (Error::from(e), false);
+    let schema = db.schema().clone();
+    // Every earlier commit is published, so this is the latest version.
+    let snap = db.snapshot();
+    let mut txn = db.storage().begin().map_err(refused)?;
+    let mut next = next_seq.load(Ordering::SeqCst);
+    let mut entities = HashSet::new();
+    let mut out = Vec::with_capacity(group.len());
+    for (op, _) in group.iter_mut() {
+        let mut done = Done::default();
+        match op {
+            Op::Put(recs) => {
+                for p in recs.iter_mut() {
+                    if p.how == How::Entity && (snap.lookup(&Value::Str(p.rec.id.clone())).is_some() || !entities.insert(p.rec.id.clone())) {
+                        continue; // stored already, or earlier in this group
+                    }
+                    if p.how != How::Replace {
+                        p.rec.seq = next;
+                        next += 1;
+                    }
+                    if p.how == How::New {
+                        p.rec.id = record_id(&p.rec.session, p.rec.seq);
+                    }
+                    let mut doc = p.rec.to_doc(p.emb.clone());
+                    schema.fill_generated(&mut doc);
+                    txn.upsert(doc).map_err(refused)?;
+                    if p.how == How::New {
+                        done.stored.push(p.rec.clone());
+                    }
+                }
+            }
+            Op::Delete(id) => done.found = txn.delete(&Value::Str(id.clone())).map_err(refused)?,
+            Op::Load(_) | Op::Flush => unreachable!("only puts and deletes are grouped"),
+        }
+        out.push(done);
+    }
+    let r = txn.commit();
+    // A failed commit may have been logged: its numbers are not given again.
+    next_seq.store(next, Ordering::SeqCst);
+    r.map_err(|e| (e.into(), true))?;
+    Ok(out)
 }
 
 /// A row projected with [`COLUMNS`] as a record.
@@ -529,6 +705,61 @@ mod tests {
         // A retag keeps the links.
         s.retag(&todo, "done").unwrap();
         assert_eq!(s.get(&[todo]).unwrap()[0].links.len(), 3);
+    }
+
+    /// Threads append at once (one writer commits them, in groups) while
+    /// others read: numbers follow commit order, so a reader never sees a
+    /// record without every earlier one, and an entity named by several
+    /// appends at once is stored once.
+    #[test]
+    fn concurrent_appends_are_numbered_in_commit_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let ids: Vec<Vec<String>> = std::thread::scope(|sc| {
+            for _ in 0..2 {
+                sc.spawn(|| {
+                    while !done.load(Ordering::Acquire) {
+                        let p = s.pinned();
+                        let max = p.query("SELECT seq FROM memory ORDER BY seq DESC LIMIT 1").unwrap().rows.first().map_or(0, |r| r[0].as_i64().unwrap());
+                        assert_eq!(p.len() as i64, max, "every number up to the newest is stored");
+                        let n = p.query("SELECT id FROM memory WHERE kind = 'entity' AND id = 'e:count sheet' LIMIT 5").unwrap().rows.len();
+                        assert!(n <= 1, "{n} copies of one entity");
+                    }
+                });
+            }
+            let ws: Vec<_> = (0..8)
+                .map(|t| {
+                    let s = &s;
+                    sc.spawn(move || {
+                        let mut ids = Vec::new();
+                        for i in 0..40 {
+                            let d = Draft::new(Kind::Fact, format!("Writer {t} note {i} about the count sheet")).entities(vec!["count sheet".into(), format!("bin {t}")]);
+                            let got = s.append(&format!("sess-{t}"), 1, 100, vec![d, Draft::new(Kind::Prompt, format!("prompt {t} {i}"))]).unwrap();
+                            assert_eq!(got.len(), 2);
+                            assert_eq!(got[1].seq, got[0].seq + 1);
+                            ids.extend(got.into_iter().map(|r| r.id));
+                        }
+                        ids
+                    })
+                })
+                .collect();
+            let ids = ws.into_iter().map(|h| h.join().unwrap()).collect();
+            done.store(true, Ordering::Release);
+            ids
+        });
+        let all: std::collections::HashSet<&String> = ids.iter().flatten().collect();
+        assert_eq!(all.len(), 8 * 40 * 2);
+        // 640 records, the shared entity and one bin per writer.
+        assert_eq!(s.len(), 640 + 1 + 8);
+        assert_eq!(s.last_seq(), 649);
+        assert_eq!(s.get(&["e:count sheet".into()]).unwrap().len(), 1);
+        assert!(s.delete(&ids[0][0]).unwrap());
+        assert!(!s.delete(&ids[0][0]).unwrap());
+        s.flush().unwrap();
+        drop(s);
+        let s = store(dir.path());
+        assert_eq!((s.len(), s.last_seq()), (648, 649));
     }
 
     #[test]

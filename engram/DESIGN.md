@@ -55,12 +55,27 @@ socket.
 - **Warm state.** The embedder, segment readers and the memtable stay in
   memory between hooks. The embedding table is memory-mapped, so a daemon
   starts without reading it.
-- **Cheap writes.** A write makes the next query rebuild the last memtable
-  chunk's in-memory segment. Chunks hold 256 records and scan their vectors
-  instead of building a graph (Strata's `mem_build` option), so a query right
-  after a tool call no longer waits tens of milliseconds for that rebuild.
-  IDF for the gate comes from the segments' term dictionaries, not from a
-  `COUNT` query per term.
+- **Reads in parallel, one writer.** Each client connection gets a thread,
+  and reads run on it against a snapshot, any number at once. Every write
+  goes to one writer thread, which commits whatever is queued as one
+  transaction (one WAL sync), numbers new records in commit order, and
+  flushes and merges between transactions. Callers embed on their own
+  threads and return once their write is visible, so a session reads its
+  own writes. The writer also builds each new version before the write
+  returns (Strata's `publish_snapshots`), including the last memtable
+  chunk's in-memory segment, so a reader never builds an index or waits for
+  one. Chunks hold 256 records and scan their vectors instead of building a
+  graph (Strata's `mem_build` option), so that build stays cheap. In the
+  cloud container at 1M records, with four prompt clients and a tool hook
+  every 10 ms, the daemon answers 146–149 prompts a second at a 56–57 ms
+  p99, against 87–112 prompts and 81–120 ms when readers built the segment
+  (`results/concurrency/`).
+- **One snapshot per request.** The searches behind one prompt (BM25 and
+  vectors, main and knowledge queries, the query engine's searches) share a
+  snapshot, so they agree however much is written meanwhile. They run side
+  by side while cores are free, and one after the other once every core is
+  searching, where splitting a request would only slow the others. IDF for the gate comes from the segments' term dictionaries,
+  not from a `COUNT` query per term.
 - **Never in the way.** A client that cannot reach the daemon within its
   deadline prints nothing and exits 0. A memory failure never blocks a
   prompt or a tool call.
@@ -218,13 +233,14 @@ There are three push points and one pull path:
    - `memory_remember(kind, text, files)` and `memory_forget(id)`.
 
    Tool descriptions and a short `CLAUDE.md` note say when to use each,
-   phrased as facts.
+   phrased as facts. The server answers calls side by side, so a quick
+   search is not held up by a `memory_ask` still running.
 
 ### Ranking
 
 BM25 and vector search each return their top \(n = 50\) under the exclusion
-filter (two Strata queries). Their scores are min-max normalised over the
-union \(C\), with a missing score counting as 0:
+filter (two Strata queries on one snapshot). Their scores are min-max
+normalised over the union \(C\), with a missing score counting as 0:
 
 \[ \mathrm{rel}(r) = w\,\widehat{\mathrm{bm25}}(r) + (1 - w)\,\widehat{\cos}(r). \]
 
@@ -272,7 +288,7 @@ differ.
 | `PostToolUse`, `Stop` client | < 10 ms (queued, embedded and committed in the background) |
 | `UserPromptSubmit` | < 100 ms p99 at 1M records (measured on an Apple M2: 24.9 ms p50, 38.6 ms p99 as a hook process, with 1% knowledge records; the knowledge query runs beside the main search; about 10 ms of it is process start) |
 | `SessionStart` | < 150 ms (daemon already up), < 1 s with daemon spawn |
-| background | after each write, the daemon rebuilds the in-memory segment (at most 256 records, no graph) so the next query does not |
+| background | the writer thread commits queued writes together and builds the new in-memory segment (at most 256 records, no graph) before they return, so no query does |
 | ingest | > 1,000 records per second with the static embedder |
 
 The default embedder is static (Model2Vec potion-retrieval-32M: token

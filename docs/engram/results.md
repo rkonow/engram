@@ -330,6 +330,17 @@ Later work removed the biggest remaining cost, which was not the search at all. 
 
 At a million records the latency benchmark then ran three times per side, alternating. The prompt hook's median is 16.0–17.7 ms on `main` and 15.8–17.5 ms changed (16.9 against 16.8 on average), its p99 27–40 against 30–35 ms; appends (p50 0.6–0.8 ms) and a query right after a write (11–15 ms) overlap as well. The changes cost nothing measurable here. An earlier comparison on the M2 MacBook Air, with a build from before the last query engine changes, found the prompt hook about 1 ms (4%) slower at the median in each of three pairs; the container's run-to-run spread, about 2 ms, is larger than that. Against the M2 numbers above, the container searches more slowly (a recall query at a million records takes 11–15 ms against 5.7) and starts hook processes faster (3 ms against 10), and its appends do not wait for a drive cache flush (0.7 ms against 4.5). The files are in `engram/results/v2/cloud/` and `engram/results/v2/m2/`, with the machine's load before and after each run.
 
+**Concurrent reads, one writer.** Reads now run side by side on a snapshot and never wait for a write: one writer thread commits everything queued as one transaction and builds the new in-memory segment before the write returns, instead of the next query building it while other readers queue behind. A lone prompt also splits its BM25, vector and knowledge searches across the cores. Measured in the same container on 2026-10-19, `main` (01f9562) against the change, two runs per side, alternating; prompt clients send prompt hooks back to back to one daemon while another client sends a tool hook every 10 ms:
+
+| records, prompt clients | prompt p50, main → changed | prompt p99, main → changed | prompts per second, main → changed |
+|---|---|---|---|
+| 100,000, 1 | 8.2–8.6 → 4.8–5.0 ms | 15.1–18.8 → 8.9–9.4 ms | 112–119 → 192–200 |
+| 100,000, 4 | 24.1–26.5 → 11.7–12.8 ms | 68.4–92.1 → 27.1–30.9 ms | 134–148 → 292–321 |
+| 1,000,000, 1 | 16.9–17.5 → 11.0–11.3 ms | 38.1–38.2 → 27.5–29.6 ms | 54–56 → 82–84 |
+| 1,000,000, 4 | 33.2–41.5 → 25.3–25.5 ms | 81.0–120.1 → 55.6–56.9 ms | 87–112 → 146–149 |
+
+One prompt at a time at a million records, the prompt hook (process start included) fell from 18.7–19.3 to 14.0–14.1 ms at the median. The cost is on the write side: an append returns after 2.6–3.2 ms instead of 0.9–1.0, because it waits for the new version to be built; the daemon stores records after the hook has answered, so no hook waits for that. With four prompt clients at 100,000 records the tool hook's own p99 rose from 8 to 12–13 ms while the daemon answered twice as many prompts. Every table and the variants that were tried and dropped are in [`engram/results/concurrency/`](https://github.com/rkonow/engram/blob/main/engram/results/concurrency/README.md).
+
 Quality is what degrades with size: the filler here is chat on every subject, while real project history is more homogeneous, so this is a stress test rather than a forecast. Strata's filters (session, time, file, kind) are what keep large stores precise, and `memory_sql` gives the model those filters directly.
 
 ## Reproducing the recorded numbers

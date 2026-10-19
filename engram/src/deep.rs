@@ -418,6 +418,8 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
 /// Runs every search (and two baseline ones on the request itself) and
 /// fuses the lists by reciprocal rank.
 pub fn gather(store: &Store, cfg: &DeepConfig, request: &str, plan: &Plan, filter: &Filter) -> (Vec<Cand>, Vec<String>) {
+    // The searches run side by side, all on one snapshot.
+    let store = &store.pinned();
     let mut queries: Vec<Query> = vec![
         Query { kind: "text".into(), q: clip(request, 2000), names: vec![], path: String::new(), sql_where: String::new(), sql_order: String::new(), kinds: vec![] },
         Query { kind: "notes".into(), q: clip(request, 2000), names: vec![], path: String::new(), sql_where: String::new(), sql_order: String::new(), kinds: vec![] },

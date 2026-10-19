@@ -1,0 +1,33 @@
+Machine: cloud container (the one the October benchmark runs used)
+cpu: Intel(R) Xeon(R) Processor @ 2.10GHz, 4 cores (1 thread per core), L2 2 MiB per core
+memory: 15 GiB; kernel 6.18.44-fc-v139
+rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+
+Checkouts (separate target dirs, cargo build --release --bins in each engram/)
+main:   01f9562 (main after PR #10), plus the `concurrency` subcommand of engram-bench (same file as the
+        branch's, except that prompt_searches runs the knowledge search on its own thread, as main's daemon does)
+branch: claude/concurrent-reads-single-writer-ojc9d3; final build ee4a61e. Earlier builds 33e7d63, f08c352
+        and a91b09f were run once each (branch/variants/).
+
+Runs: one at a time; each waited until no cargo, rustc or engram-bench process was running and the
+1-minute load average was under 1.0 (4 cores). ENGRAM_MODELS=/home/claude/data/models (copied from the
+Mac's download; Hugging Face is blocked here). data: /home/claude/data/memory/longmemeval_s.jsonl;
+embedder: static (potion-retrieval-32M); default options otherwise.
+  concurrency: engram-bench concurrency --data <data> --sizes 100000,1000000
+  latency:     engram-bench latency --data <data> --sizes 1000000
+
+Load averages (1, 5, 15 min) at the start and end of each run, 2026-10-19 (UTC):
+  main concurrency (r1)   | 17:20:43 | waited 80s | 0.97 3.04 2.13 | end 17:34:03 exit 0 | 2.72 2.11 2.01
+  main latency_1m (r1)    | 17:48:55 | waited 50s | 0.93 2.38 2.45 | end 17:58:58 exit 0 | 0.26 0.94 1.69
+      (a git commit and push, a few seconds, ran while this run was still embedding and loading its store,
+       before any timing)
+  branch 33e7d63          | 17:58:58 | waited 0s  | 0.26 0.94 1.69 | end 18:11:55 exit 0 | 4.69 2.86 2.27  -> variants/always_split_33e7d63
+  branch f08c352          | 18:24:50 | waited 70s | 0.86 1.53 1.60 | end 18:37:33 exit 0 | 3.54 2.34 1.96  -> variants/thread_count_f08c352
+  branch a91b09f          | 18:44:03 | waited 70s | 0.94 2.04 1.95 | stopped 18:46:30 in the 100K daemon part  -> variants/rayon_a91b09f_partial
+  branch concurrency (r1) | 18:52:13 | waited 80s | 0.90 2.03 2.02 | end 19:05:02 exit 0 | 3.63 2.41 2.17
+  main concurrency_r2     | 19:06:32 | waited 90s | 0.85 1.80 1.97 | end 19:20:02 exit 0 | 3.51 2.17 1.96
+  branch concurrency_r2   | 19:21:23 | waited 80s | 0.92 1.66 1.79 | end 19:34:05 exit 0 | 3.34 2.28 2.03
+  branch latency_1m (r1)  | 19:35:35 | waited 90s | 0.89 1.73 1.85 | end 19:45:24 exit 0 | 0.37 0.90 1.40
+  main latency_1m_r2      | 19:45:24 | waited 0s  | 0.37 0.90 1.40 | end 19:55:30 exit 0 | 0.37 0.79 1.17
+  branch latency_1m_r2    | 19:55:30 | waited 0s  | 0.37 0.79 1.17 | end 20:05:17 exit 0 | 0.23 0.77 1.05
+Load averages at the end of a concurrency run are high because the benchmark itself keeps all 4 cores busy.

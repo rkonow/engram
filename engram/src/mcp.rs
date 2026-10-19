@@ -1,8 +1,10 @@
 //! `engram mcp`: a Model Context Protocol server over stdio (newline-
 //! delimited JSON-RPC 2.0) exposing the memory tools. Each call is forwarded
-//! to the project's daemon.
+//! to the project's daemon, on its own thread: a quick search is answered
+//! while a slow `memory_ask` is still running.
 
 use std::io::{BufRead, Write};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value as Json};
@@ -97,44 +99,100 @@ pub fn run() -> i32 {
     let project = paths::project_dir(None);
     let dir = paths::store_dir(&project);
     let proj = project.to_string_lossy().to_string();
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_str::<Json>(&line) else { continue };
-        let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let result = match method {
-            "initialize" => {
-                let version = msg.pointer("/params/protocolVersion").and_then(|v| v.as_str()).unwrap_or("2025-06-18");
-                Some(json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "engram", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": INSTRUCTIONS
-                }))
-            }
-            "ping" => Some(json!({})),
-            "tools/list" => Some(json!({"tools": tools()})),
-            "tools/call" => {
-                let name = msg.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
-                let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-                let (text, is_error) = call(&dir, &proj, name, &args);
-                Some(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
-            }
-            _ => None,
-        };
-        let Some(id) = id else { continue }; // notifications get no response
-        let resp = match result {
-            Some(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            None => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("method not found: {method}")}}),
-        };
-        if writeln!(out, "{resp}").is_err() || out.flush().is_err() {
-            break;
-        }
-    }
+    serve(std::io::stdin().lock(), &Mutex::new(std::io::stdout()), |name, args| call(&dir, &proj, name, args));
     0
+}
+
+/// Answers the requests read from `input` on `out`. Tool calls run side by
+/// side, each on its own thread, and their responses (which carry their
+/// request's id) are written as they finish; at the end of the input the
+/// calls still running are waited for.
+pub fn serve<W: Write + Send>(input: impl BufRead, out: &Mutex<W>, call: impl Fn(&str, &Json) -> (String, bool) + Sync) {
+    let call = &call;
+    std::thread::scope(|sc| {
+        for line in input.lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(msg) = serde_json::from_str::<Json>(&line) else { continue };
+            let id = msg.get("id").cloned();
+            let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let result = match method {
+                "initialize" => {
+                    let version = msg.pointer("/params/protocolVersion").and_then(|v| v.as_str()).unwrap_or("2025-06-18");
+                    Some(json!({
+                        "protocolVersion": version,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": {"name": "engram", "version": env!("CARGO_PKG_VERSION")},
+                        "instructions": INSTRUCTIONS
+                    }))
+                }
+                "ping" => Some(json!({})),
+                "tools/list" => Some(json!({"tools": tools()})),
+                "tools/call" => {
+                    let name = msg.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+                    sc.spawn(move || {
+                        let (text, is_error) = call(&name, &args);
+                        respond(out, id, method_result(Some(json!({"content": [{"type": "text", "text": text}], "isError": is_error})), "tools/call"));
+                    });
+                    continue;
+                }
+                _ => None,
+            };
+            if !respond(out, id, method_result(result, method)) {
+                break;
+            }
+        }
+    });
+}
+
+/// A result, or the error for a method that has none.
+fn method_result(result: Option<Json>, method: &str) -> std::result::Result<Json, Json> {
+    result.ok_or_else(|| json!({"code": -32601, "message": format!("method not found: {method}")}))
+}
+
+/// Writes one response (none for a notification); false when the output is gone.
+fn respond<W: Write>(out: &Mutex<W>, id: Option<Json>, result: std::result::Result<Json, Json>) -> bool {
+    let Some(id) = id else { return true };
+    let resp = match result {
+        Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+        Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
+    };
+    let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+    writeln!(out, "{resp}").is_ok() && out.flush().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slow call does not hold up a quick one sent after it.
+    #[test]
+    fn tool_calls_run_side_by_side() {
+        let input = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "memory_ask", "arguments": {"question": "why?"}}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "memory_search", "arguments": {"query": "planner"}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "nope"}),
+        ]
+        .map(|m| m.to_string())
+        .join("\n");
+        let out = Mutex::new(Vec::new());
+        serve(std::io::Cursor::new(input), &out, |name, args| {
+            if name == "memory_ask" {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            (format!("{name} {args}"), false)
+        });
+        let out = String::from_utf8(out.into_inner().unwrap()).unwrap();
+        let resps: Vec<Json> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let ids: Vec<i64> = resps.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids.len(), 4, "{out}");
+        assert_eq!(ids.last(), Some(&1), "the slow call answers last: {out}");
+        assert!(resps.iter().any(|r| r["id"] == 2 && r["result"]["content"][0]["text"].as_str().unwrap().starts_with("memory_search")));
+        assert!(resps.iter().any(|r| r["id"] == 4 && r["error"]["code"] == -32601));
+    }
 }

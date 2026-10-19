@@ -38,7 +38,7 @@ Strata holds an exclusive lock on its file, and hooks are short-lived processes 
 
 - **Lazy start.** The first client to find no socket spawns the daemon under a spawn lock; the daemon exits after 30 idle minutes. Its first hook takes 50–72 ms, because the 129 MB embedding table is memory-mapped rather than read.
 - **Warm state.** The embedder, segment readers and the memtable stay in memory between hooks.
-- **Cheap writes.** A write makes the next query rebuild the last memtable chunk's in-memory segment. Chunks hold 256 records and scan their vectors instead of building an HNSW graph, so a query right after a tool call costs what any query costs.
+- **Reads in parallel, one writer.** Reads run on each client's own thread against a snapshot, any number at once, and the searches behind one prompt share that snapshot and run side by side while cores are free. Every write goes to one writer thread, which commits whatever is queued in one transaction and builds the new version before the write returns, so a reader never waits for a write or for the index build after it. In-memory chunks hold 256 records and scan their vectors instead of building an HNSW graph, so that build stays cheap.
 - **Never in the way.** A client that cannot reach the daemon within its deadline prints nothing and exits 0. A memory failure never blocks a prompt or a tool call.
 
 The store lives outside the repository, in `${ENGRAM_HOME:-~/.local/share/engram}/<project-slug>/`, because transcripts can contain secrets. A redaction pass removes common key and token formats before anything is stored.

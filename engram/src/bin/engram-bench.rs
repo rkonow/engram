@@ -164,6 +164,35 @@ enum Cmd {
         #[arg(long, default_value_t = 0.01)]
         knowledge: f64,
     },
+    /// Reads while records are written: reader threads run the prompt's
+    /// searches (knowledge and hybrid search side by side, then packing, as
+    /// the prompt hook does) for a fixed time, alone and while a writer
+    /// appends a tool call and its result at a steady rate; then the same
+    /// through a daemon, with clients sending prompt hooks while another
+    /// sends tool hooks.
+    Concurrency {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "100000,1000000")]
+        sizes: Vec<usize>,
+        #[arg(long, default_value = "static")]
+        embedder: String,
+        #[arg(long, default_value = "results/concurrency")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 94)]
+        queries: usize,
+        /// Reader threads (and prompt clients) per configuration.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4")]
+        readers: Vec<usize>,
+        /// Seconds per configuration.
+        #[arg(long, default_value_t = 10)]
+        secs: u64,
+        /// Pause between the writer's appends (and the tool client's hooks).
+        #[arg(long, default_value_t = 10)]
+        write_every_ms: u64,
+        #[arg(long, default_value_t = 0.01)]
+        knowledge: f64,
+    },
     /// Embeds a text field of every JSON line of a file into raw float32
     /// vectors (`<out>`, n × dim, little-endian), for other tools (Strata's
     /// graph benchmark embeds arXiv papers with it).
@@ -603,6 +632,9 @@ fn main() {
         }
         Cmd::Scale { data, sizes, embedder, out, queries, hooks, hook_gap_ms } => scale_cmd(&data, &sizes, &embedder, &out, queries, hooks, hook_gap_ms),
         Cmd::Latency { data, sizes, embedder, out, queries, rounds, hooks, knowledge } => latency_cmd(&data, &sizes, &embedder, &out, queries, rounds, hooks, knowledge),
+        Cmd::Concurrency { data, sizes, embedder, out, queries, readers, secs, write_every_ms, knowledge } => {
+            concurrency_cmd(&data, &sizes, &embedder, &out, queries, &readers, secs, write_every_ms, knowledge)
+        }
         Cmd::Probes { transcript, probes, points, embedder, project, out, cache, dump_missing, dump_probes, per_turn, max_records } => {
             let d = PackParams::default();
             let pack = PackParams { per_turn: per_turn.unwrap_or(d.per_turn), max_records: max_records.unwrap_or(d.max_records), ..d };
@@ -1576,5 +1608,226 @@ fn latency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queri
         let _ = std::fs::remove_dir_all(&home);
         results.push(Json::Object(row));
         std::fs::write(out.join(format!("latency_{}.json", embedder.split(':').next().unwrap_or("x"))), serde_json::to_string_pretty(&results).unwrap()).unwrap();
+    }
+}
+
+/// The prompt hook's searches for one prompt: knowledge and hybrid search
+/// side by side when a core is free (as the daemon runs them), then packing.
+fn prompt_searches(store: &Store, q: &str, filter: &Filter, rank: &RankParams, kp: &recall::KnowledgeParams) {
+    let skip = HashSet::new();
+    let (known, searched) = recall::both(|| recall::knowledge(store, q, filter, &skip, kp), || recall::search(store, q, filter, rank));
+    known.unwrap();
+    let (hits, _) = searched.unwrap();
+    let _ = recall::pack(&hits, q, &skip, &PackParams::default());
+}
+
+/// A tool call and its result, as a tool hook stores them.
+fn tool_drafts(i: i64) -> Vec<engram::record::Draft> {
+    vec![
+        engram::record::Draft::new(Kind::ToolCall, format!("$ cargo test --package p{i} -- --nocapture")).ctx("Turn 3 request: fix the parser"),
+        engram::record::Draft::new(Kind::ToolResult, format!("running 12 tests\ntest parser::tests::case_{i} ... ok\ntest result: ok. {i} passed; 0 failed")).ctx("Turn 3 request: fix the parser"),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn concurrency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queries: usize, readers: &[usize], secs: u64, every_ms: u64, knowledge: f64) {
+    use std::sync::atomic::AtomicBool;
+    let e = open_embedder(embedder);
+    let units = engram::benchdata::read_units(data, 1, None).expect("data");
+    let every = std::time::Duration::from_millis(every_ms);
+    let run_for = std::time::Duration::from_secs(secs);
+    let mut results = Vec::new();
+    std::fs::create_dir_all(out).unwrap();
+    for &n in sizes {
+        eprintln!("== {n} records");
+        let (mut recs, qs, _) = haystack(&units, n, n_queries);
+        if knowledge > 0.0 {
+            let every = (1.0 / knowledge).round().max(1.0) as usize;
+            let kinds = [Kind::Decision, Kind::Preference, Kind::Fact];
+            for (i, r) in recs.iter_mut().enumerate().filter(|(i, _)| i % every == 0) {
+                r.kind = kinds[(i / every) % 3];
+                r.tag = "distilled".into();
+            }
+        }
+        let texts: Vec<String> = recs.iter().map(|r| r.embed_text()).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            let chunks: Vec<&[&str]> = refs.chunks((refs.len() / 4).max(1)).collect();
+            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c)) }).collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        drop(texts);
+        let home = std::env::temp_dir().join(format!("engram-concurrency-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::env::set_var("ENGRAM_HOME", &home);
+        std::env::set_var("ENGRAM_DEEP", "off");
+        std::env::set_var("ENGRAM_DISTILL", "0");
+        let dir = engram::paths::store_dir(&project);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), serde_json::to_string(&json!({"embedder": embedder})).unwrap()).unwrap();
+        let db = dir.join("memory.strata");
+        {
+            let store = Store::open(&db, e.clone(), StoreOptions { sync: false, flush_docs: usize::MAX / 8, ..Default::default() }).unwrap();
+            store.bulk_insert(&recs, embs).unwrap();
+        }
+        let n = recs.len();
+        drop(recs);
+        let wal = { let mut w = db.as_os_str().to_owned(); w.push("-wal"); PathBuf::from(w) };
+        let _ = std::fs::remove_file(&wal);
+        let mut row = serde_json::Map::new();
+        row.insert("records".into(), json!(n));
+        row.insert("secs".into(), json!(secs));
+        row.insert("write_every_ms".into(), json!(every_ms));
+
+        // 1. In this process: reader threads on one store, with and without
+        //    a writer. Each configuration starts from the bulk-loaded file
+        //    (its appends stay in the memtable and the WAL, deleted after).
+        let mut runs = Vec::new();
+        for &k in readers {
+            for writer in [false, true] {
+                let _ = std::fs::remove_file(&wal);
+                let store = Store::open(&db, e.clone(), StoreOptions::default()).unwrap();
+                store.warm();
+                let filter = Filter { exclude_window: Some(("bench-live".into(), i64::MAX)), ..Default::default() };
+                let (rank, kp) = (RankParams::default(), recall::KnowledgeParams::default());
+                let stop = AtomicBool::new(false);
+                let (store, qs, filter, rank, kp, stop) = (&store, &qs, &filter, &rank, &kp, &stop);
+                let (lat, app) = std::thread::scope(|sc| {
+                    let w = writer.then(|| {
+                        sc.spawn(move || {
+                            let mut app = Vec::new();
+                            let mut i = 0i64;
+                            while !stop.load(Ordering::Acquire) {
+                                let t = Instant::now();
+                                store.append("bench-live", i, 0, tool_drafts(i)).unwrap();
+                                app.push(ms_since(t));
+                                i += 1;
+                                std::thread::sleep(every);
+                            }
+                            app
+                        })
+                    });
+                    let rs: Vec<_> = (0..k)
+                        .map(|r| {
+                            sc.spawn(move || {
+                                let mut lat = Vec::new();
+                                let mut i = r * 31;
+                                while !stop.load(Ordering::Acquire) {
+                                    let q = &qs[i % qs.len()].0.question;
+                                    let t = Instant::now();
+                                    prompt_searches(store, q, filter, rank, kp);
+                                    lat.push(ms_since(t));
+                                    i += 1;
+                                }
+                                lat
+                            })
+                        })
+                        .collect();
+                    std::thread::sleep(run_for);
+                    stop.store(true, Ordering::Release);
+                    let lat: Vec<f64> = rs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+                    (lat, w.map(|h| h.join().unwrap()).unwrap_or_default())
+                });
+                let _ = std::fs::remove_file(&wal);
+                eprintln!(
+                    "  store: {k} readers{}: read p50 {:.2} p99 {:.2} ms, {:.0} reads/s; {} appends, p50 {:.2} p99 {:.2} ms",
+                    if writer { " + writer" } else { "" },
+                    pct(&mut lat.clone(), 0.5),
+                    pct(&mut lat.clone(), 0.99),
+                    lat.len() as f64 / secs as f64,
+                    app.len(),
+                    pct(&mut app.clone(), 0.5),
+                    pct(&mut app.clone(), 0.99)
+                );
+                runs.push(json!({"readers": k, "writer": writer, "read": stats(&lat), "reads_per_s": lat.len() as f64 / secs as f64, "append": stats(&app), "appends": app.len()}));
+            }
+        }
+        row.insert("store".into(), Json::Array(runs));
+
+        // 2. Through a daemon: prompt clients back to back, with and without
+        //    a client sending tool hooks. Each configuration gets a fresh
+        //    daemon on a copy of the bulk-loaded file (stopped with SIGKILL,
+        //    so it does not flush its memtable into the file).
+        let exe = std::env::current_exe().unwrap().with_file_name("engram");
+        let backup = dir.join("memory.strata.bak");
+        std::fs::copy(&db, &backup).unwrap();
+        let proj = project.to_string_lossy().to_string();
+        let mut runs = Vec::new();
+        for &k in readers {
+            for writer in [false, true] {
+                for f in [&wal, &dir.join("state.json")] {
+                    let _ = std::fs::remove_file(f);
+                }
+                std::fs::copy(&backup, &db).unwrap();
+                let first = json!({"session_id": "bench-start", "hook_event_name": "Notification", "cwd": project});
+                run_hook(&exe, &home, &project, "Notification", &first);
+                let pid = engram::daemon::request(&dir, &proj, &json!({"op": "ping"}), std::time::Duration::from_secs(30)).unwrap()["pid"].as_i64().unwrap();
+                let stop = AtomicBool::new(false);
+                let (dir, proj, qs, stop) = (&dir, &proj, &qs, &stop);
+                let (lat, tools) = std::thread::scope(|sc| {
+                    let w = writer.then(|| {
+                        sc.spawn(move || {
+                            let mut lat = Vec::new();
+                            let mut i = 0;
+                            while !stop.load(Ordering::Acquire) {
+                                let tool = json!({"session_id": "bench-tool", "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                                    "tool_input": {"command": format!("cargo test case_{i}")}, "tool_response": {"stdout": format!("test result: ok. {i} passed"), "stderr": ""}});
+                                let t = Instant::now();
+                                let _ = engram::daemon::request(dir, proj, &json!({"op": "hook", "event": "PostToolUse", "payload": tool}), std::time::Duration::from_secs(10));
+                                lat.push(ms_since(t));
+                                i += 1;
+                                std::thread::sleep(every);
+                            }
+                            lat
+                        })
+                    });
+                    let rs: Vec<_> = (0..k)
+                        .map(|r| {
+                            sc.spawn(move || {
+                                let mut lat = Vec::new();
+                                let mut i = r * 31;
+                                while !stop.load(Ordering::Acquire) {
+                                    let q = &qs[i % qs.len()].0.question;
+                                    let prompt = json!({"session_id": format!("bench-c{r}"), "hook_event_name": "UserPromptSubmit", "prompt": q});
+                                    let t = Instant::now();
+                                    let resp = engram::daemon::request(dir, proj, &json!({"op": "hook", "event": "UserPromptSubmit", "payload": prompt}), std::time::Duration::from_secs(10));
+                                    lat.push(ms_since(t));
+                                    assert!(resp.is_ok_and(|r| r.get("error").is_none()));
+                                    i += 1;
+                                }
+                                lat
+                            })
+                        })
+                        .collect();
+                    std::thread::sleep(run_for);
+                    stop.store(true, Ordering::Release);
+                    let lat: Vec<f64> = rs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+                    (lat, w.map(|h| h.join().unwrap()).unwrap_or_default())
+                });
+                let stats_resp = engram::daemon::request(dir, proj, &json!({"op": "stats"}), std::time::Duration::from_secs(30)).unwrap_or(Json::Null);
+                // SAFETY: kill has no memory-safety preconditions.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                eprintln!(
+                    "  daemon: {k} prompt clients{}: prompt p50 {:.2} p99 {:.2} ms, {:.0} prompts/s; {} tool hooks, p50 {:.2} p99 {:.2} ms; {} records",
+                    if writer { " + tool hooks" } else { "" },
+                    pct(&mut lat.clone(), 0.5),
+                    pct(&mut lat.clone(), 0.99),
+                    lat.len() as f64 / secs as f64,
+                    tools.len(),
+                    pct(&mut tools.clone(), 0.5),
+                    pct(&mut tools.clone(), 0.99),
+                    stats_resp["records"]
+                );
+                runs.push(json!({"clients": k, "tool_hooks": writer, "prompt": stats(&lat), "prompts_per_s": lat.len() as f64 / secs as f64,
+                    "tool": stats(&tools), "tool_hooks_sent": tools.len(), "records_after": stats_resp["records"]}));
+            }
+        }
+        row.insert("daemon".into(), Json::Array(runs));
+        let _ = std::fs::remove_dir_all(&home);
+        results.push(Json::Object(row));
+        std::fs::write(out.join(format!("concurrency_{}.json", embedder.split(':').next().unwrap_or("x"))), serde_json::to_string_pretty(&results).unwrap()).unwrap();
     }
 }

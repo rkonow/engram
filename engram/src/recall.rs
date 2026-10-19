@@ -1,7 +1,10 @@
 //! Hybrid retrieval with priors, the injection gate, snippets and the
 //! text Engram injects.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -209,21 +212,81 @@ fn analyzed(text: &str) -> HashSet<String> {
     strata::text::analyze(text).into_iter().collect()
 }
 
+/// Requests running [`both`] now.
+static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// The threads this thread's part of a request may use; 0 outside one.
+    static SHARE: Cell<usize> = const { Cell::new(0) };
+}
+
+fn cores() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// A request's share of the cores: divided among the requests running when
+/// it starts.
+struct Request;
+
+impl Request {
+    fn start() -> Request {
+        let n = REQUESTS.fetch_add(1, Ordering::AcqRel) + 1;
+        SHARE.set((cores() / n).max(1));
+        Request
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        SHARE.set(0);
+        REQUESTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Runs `a` and `b` side by side (`a` on another thread) when the request's
+/// share of the cores allows, else one after the other. A lone request
+/// splits across every core; with every core busy, splitting a request
+/// would only slow the others down.
+pub fn both<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> (A, B) {
+    let _request = (SHARE.get() == 0).then(Request::start);
+    let share = SHARE.get();
+    if share < 2 {
+        return (a(), b());
+    }
+    let theirs = share / 2;
+    SHARE.set(share - theirs);
+    let out = std::thread::scope(|s| {
+        let h = s.spawn(move || {
+            SHARE.set(theirs);
+            a()
+        });
+        let b = b();
+        (h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), b)
+    });
+    SHARE.set(share);
+    out
+}
+
 /// Hybrid search: BM25 and vector candidates, min-max fused, with priors.
+/// The two searches run on one snapshot, side by side when a core is free.
 pub fn search(store: &Store, query: &str, filter: &Filter, p: &RankParams) -> Result<(Vec<Hit>, Evidence)> {
+    let store = &store.pinned();
     let terms = strata::text::analyze_query(query);
-    let bm = if p.use_bm25 && !terms.is_empty() { store.bm25_top(query, p.n, filter)? } else { Vec::new() };
-    let vq = if p.use_vectors { Some(store.embedder.embed_query(query)) } else { None };
-    let mut dv = match &vq {
-        Some(v) => store.vector_top(v, p.n, filter)?,
-        None => Vec::new(),
-    };
+    let (bm, (vq, dv)) = both(
+        || if p.use_bm25 && !terms.is_empty() { store.bm25_top(query, p.n, filter) } else { Ok(Vec::new()) },
+        || {
+            let vq = p.use_vectors.then(|| store.embedder.embed_query(query));
+            let dv = vq.as_ref().map_or(Ok(Vec::new()), |v| store.vector_top(v, p.n, filter));
+            (vq, dv)
+        },
+    );
+    let (mut bm, mut dv) = (bm?, dv?);
     // Earlier copies of the same question and answers that admitted not
     // knowing match a repeated question best and carry nothing: they would
     // inflate the gate and repeat the failure.
     let qterms: HashSet<String> = terms.iter().cloned().collect();
     let useful = |r: &Record| r.tag != "uncertain" && r.tag != "superseded" && !same_question(r, &qterms);
-    let mut bm = bm;
     bm.retain(|(r, _)| useful(r));
     dv.retain(|(r, _)| useful(r));
     let (hits, ev) = fuse(store, query, &terms, bm, dv, p);
@@ -540,17 +603,20 @@ pub const KNOWLEDGE: [Kind; 5] = [Kind::Preference, Kind::Decision, Kind::Fact, 
 /// Knowledge records that match a prompt well enough on their own text,
 /// best first, leaving out `skip` and records closed as done or superseded.
 pub fn knowledge(store: &Store, query: &str, filter: &Filter, skip: &HashSet<String>, p: &KnowledgeParams) -> Result<Vec<(Record, f64, f64)>> {
+    let store = &store.pinned();
     let mut f = filter.clone();
     f.kinds = KNOWLEDGE.to_vec();
     let terms = strata::text::analyze_query(query);
+    let (bm, dv) = both(
+        || if terms.is_empty() { Ok(Vec::new()) } else { store.bm25_top(query, p.n, &f) },
+        || store.vector_top(&store.embedder.embed_query(query), p.n, &f),
+    );
     let mut by: HashMap<String, (Record, f64)> = HashMap::new();
-    for (r, c) in store.vector_top(&store.embedder.embed_query(query), p.n, &f)? {
+    for (r, c) in dv? {
         by.insert(r.id.clone(), (r, c));
     }
-    if !terms.is_empty() {
-        for (r, _) in store.bm25_top(query, p.n, &f)? {
-            by.entry(r.id.clone()).or_insert((r, 0.0));
-        }
+    for (r, _) in bm? {
+        by.entry(r.id.clone()).or_insert((r, 0.0));
     }
     let idf = if terms.is_empty() { Vec::new() } else { store.idf(&terms).unwrap_or_else(|_| vec![1.0; terms.len()]) };
     let total: f64 = idf.iter().sum();
@@ -576,16 +642,19 @@ pub fn knowledge(store: &Store, query: &str, filter: &Filter, skip: &HashSet<Str
 /// thresholds), best first: what the distiller is shown, so that it can
 /// update an old note instead of only the newest ones.
 pub fn related(store: &Store, text: &str, n: usize) -> Result<Vec<Record>> {
+    let store = &store.pinned();
     let f = Filter { kinds: KNOWLEDGE.to_vec(), ..Default::default() };
     let live = |r: &Record| r.tag != "superseded" && r.tag != "done" && r.tag != "cue" && (r.kind != Kind::Todo || r.tag == "planned");
+    let (bm, dv) = both(
+        || if strata::text::analyze_query(text).is_empty() { Ok(Vec::new()) } else { store.bm25_top(text, n * 2, &f) },
+        || store.vector_top(&store.embedder.embed_query(text), n * 2, &f),
+    );
     let mut score: HashMap<String, (Record, f64)> = HashMap::new();
-    for (i, (r, _)) in store.vector_top(&store.embedder.embed_query(text), n * 2, &f)?.into_iter().enumerate() {
+    for (i, (r, _)) in dv?.into_iter().enumerate() {
         score.entry(r.id.clone()).or_insert((r, 0.0)).1 += 1.0 / (10.0 + i as f64);
     }
-    if !strata::text::analyze_query(text).is_empty() {
-        for (i, (r, _)) in store.bm25_top(text, n * 2, &f)?.into_iter().enumerate() {
-            score.entry(r.id.clone()).or_insert((r, 0.0)).1 += 1.0 / (10.0 + i as f64);
-        }
+    for (i, (r, _)) in bm?.into_iter().enumerate() {
+        score.entry(r.id.clone()).or_insert((r, 0.0)).1 += 1.0 / (10.0 + i as f64);
     }
     let mut v: Vec<(Record, f64)> = score.into_values().filter(|(r, _)| live(r)).collect();
     v.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -628,6 +697,7 @@ pub fn briefing(store: &Store, current_session: &str, max_chars: usize, now: i64
 /// The briefing, with notes whose code changed since moved to a section of
 /// their own and labelled, and an index of what else the notes are about.
 pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, now: i64, mut check: Option<&mut Checker>) -> Result<(String, Vec<String>)> {
+    let store = &store.pinned();
     let total = store.len();
     if total == 0 {
         return Ok((String::new(), Vec::new()));
@@ -750,6 +820,22 @@ pub fn briefing_checked(store: &Store, current_session: &str, max_chars: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parts of a request divide its share of the cores between them,
+    /// and a request (even one that panics) gives its share back.
+    #[test]
+    fn requests_divide_their_share() {
+        let ((sa, (x, y)), sb) = both(|| (SHARE.get(), both(|| SHARE.get(), || SHARE.get())), || SHARE.get());
+        assert!(sa >= 1 && sb >= 1 && sa + sb <= cores().max(2), "{sa} + {sb}");
+        if sa >= 2 {
+            assert_eq!(x + y, sa);
+        } else {
+            assert_eq!((x, y), (1, 1));
+        }
+        assert_eq!(SHARE.get(), 0);
+        assert!(std::panic::catch_unwind(|| both(|| panic!("a search failed"), || 1)).is_err());
+        assert_eq!(SHARE.get(), 0);
+    }
 
     #[test]
     fn time_formats() {

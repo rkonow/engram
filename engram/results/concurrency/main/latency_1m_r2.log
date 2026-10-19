@@ -1,0 +1,8 @@
+== 1000000 records
+  embedder open 83.4 ms (mapped); reading the table 80.2 ms
+  phases: bm25_top50 6.21, embed_query 0.09, fuse 0.31, idf_count_queries 1.09, idf_dictionary 0.05, pack_format 0.18, search_total 10.99, vector_top50 4.48
+  chunk1024_hnsw: append 1.09, rebuild 23.30, query after write 36.84 (p99 101.02), query after rebuild 13.00
+  chunk1024_flat: append 1.01, rebuild 4.31, query after write 16.97 (p99 35.87), query after rebuild 12.92
+  chunk256_flat: append 0.95, rebuild 1.58, query after write 13.71 (p99 36.26), query after rebuild 12.72
+  chunk64_flat: append 0.92, rebuild 0.66, query after write 12.76 (p99 33.11), query after rebuild 12.25
+  hooks: client_noop 0.65, client_prompt 14.93, client_tool 0.75, process_noop 3.91, process_prompt 18.68, process_tool 3.83

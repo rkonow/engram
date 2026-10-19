@@ -213,6 +213,15 @@ the last chunk's segment is rebuilt, from the chunk in place (no document
 copies), into a page-aligned buffer. Live filters merge the stored delete
 set with pending deletes and are cached per segment.
 
+**Published snapshots.** By default the first `snapshot()` after a write
+builds the last chunk's segment, and concurrent readers queue on
+`build_lock` behind it. With `DbOptions::publish_snapshots` the writer
+builds the new version's snapshot before a commit, flush, bulk load, merge
+or vacuum returns, and stores it in `published`. `snapshot()` then only
+clones that `Arc`: a reader never builds a segment or waits for one, and a
+write returns once readers can see it. The write pays for the build instead
+of the next query. Engram turns this on.
+
 **Merges.** `merge(policy)` loops: take an on-disk snapshot, let the policy
 pick a group, and fetch the group's live documents through `doc_source`.
 It builds the merged segment with neither the writer lock nor the state
@@ -244,12 +253,14 @@ are neither reused nor moved.
 A merge's commit waits for the lock, so do not call `merge` from a thread
 that holds a `WriteTxn`. `state` is held only for pointer copies and
 in-memory updates. `build_lock` makes concurrent readers build a memtable
-segment once. An exclusive `flock` on the file admits one open `Database`
+segment once. `published` is an `RwLock` written only under the writer
+lock (and at open), so versions are published in commit order; readers
+hold its read side for one `Arc` clone. An exclusive `flock` on the file admits one open `Database`
 per file across processes; the kernel drops it if the process dies.
 
 ## Tests
 
-`cargo test --release`: 13 storage unit tests, plus 16 integration tests in
+`cargo test --release`: 13 storage unit tests, plus 19 integration tests in
 `storage_basic.rs` and 3 in `storage_crash.rs`, all passing.
 
 * Unit tests:
@@ -279,9 +290,14 @@ per file across processes; the kernel drops it if the process dies.
   * bulk-load segmenting and duplicate keys; a table without a primary key;
   * two reader threads checking every snapshot (consistent key sets,
     monotonic) while one thread commits with automatic flushes and another
-    merges;
+    merges, with and without published snapshots;
+  * published snapshots: each commit, flush, bulk load, merge, vacuum and
+    reopen publishes its version; readers get the same one until the next
+    write, see the last commit while a transaction is open, and a full
+    chunk's segment is not rebuilt;
   * random operations (transactions, rollbacks, flushes, merges, vacuums,
-    bulk loads, reopens) against a model, 6 seeds × 400 steps.
+    bulk loads, reopens) against a model, 6 seeds × 400 steps, and 3 more
+    seeds with published snapshots.
 
   Most tests end with `check()`. That verifies every segment and delete-set
   checksum, that every key is found by its segment's index, and that every

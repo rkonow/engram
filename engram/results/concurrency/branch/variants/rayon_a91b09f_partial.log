@@ -1,0 +1,10 @@
+== 100000 records
+  store: 1 readers: read p50 2.74 p99 4.75 ms, 352 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 1 readers + writer: read p50 3.08 p99 5.88 ms, 310 reads/s; 757 appends, p50 2.81 p99 6.13 ms
+  store: 2 readers: read p50 4.04 p99 10.44 ms, 445 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 2 readers + writer: read p50 4.56 p99 10.53 ms, 401 reads/s; 724 appends, p50 2.98 p99 8.04 ms
+  store: 4 readers: read p50 6.65 p99 19.07 ms, 536 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 4 readers + writer: read p50 7.82 p99 23.85 ms, 450 reads/s; 695 appends, p50 3.61 p99 10.02 ms
+  daemon: 1 prompt clients: prompt p50 4.58 p99 8.00 ms, 211 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 102118 records
+  daemon: 1 prompt clients + tool hooks: prompt p50 4.87 p99 8.36 ms, 198 prompts/s; 923 tool hooks, p50 0.40 p99 2.84 ms; 103830 records
+  daemon: 2 prompt clients: prompt p50 7.21 p99 13.52 ms, 267 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 102637 records

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::error::Result;
 use crate::forward::{DocStore, KeywordColumn, NumericColumn};
@@ -25,7 +25,7 @@ pub struct Db {
     /// Readers by segment id. On-disk segments keep their id for life
     /// (deletes travel with the snapshot, not the readers); in-memory ones
     /// get a fresh id per rebuild.
-    readers: Mutex<HashMap<u64, Arc<SegmentReaders>>>,
+    readers: RwLock<HashMap<u64, Arc<SegmentReaders>>>,
     pub exec: ExecOptions,
 }
 
@@ -39,7 +39,7 @@ impl Db {
     }
 
     fn wrap(storage: Database) -> Db {
-        Db { storage, readers: Mutex::new(HashMap::new()), exec: ExecOptions::default() }
+        Db { storage, readers: RwLock::new(HashMap::new()), exec: ExecOptions::default() }
     }
 
     pub fn storage(&self) -> &Database {
@@ -68,9 +68,14 @@ impl Db {
     }
 
     pub fn query_with(&self, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
-        let snap = self.snapshot();
+        self.query_at(&self.snapshot(), sql, params, opts)
+    }
+
+    /// Runs a query against a given snapshot (several queries that must
+    /// see the same version share one).
+    pub fn query_at(&self, snap: &Snapshot, sql: &str, params: &Params, opts: &ExecOptions) -> Result<ResultSet> {
         let select = bind(sql, snap.schema(), params)?;
-        self.execute(&snap, &select, opts)
+        self.execute(snap, &select, opts)
     }
 
     pub fn execute(&self, snap: &Snapshot, select: &Select, opts: &ExecOptions) -> Result<ResultSet> {
@@ -80,7 +85,13 @@ impl Db {
 
     /// Readers for every segment of `snap`, opened on first use.
     pub fn readers(&self, snap: &Snapshot) -> Result<Vec<Arc<SegmentReaders>>> {
-        let mut cache = self.readers.lock().unwrap();
+        {
+            let cache = self.readers.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(all) = snap.segments().iter().map(|v| cache.get(&v.id).cloned()).collect() {
+                return Ok(all);
+            }
+        }
+        let mut cache = self.readers.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::with_capacity(snap.segments().len());
         for v in snap.segments() {
             let r = match cache.get(&v.id) {
@@ -102,7 +113,7 @@ impl Db {
 
     /// Drops cached readers (e.g. before cold-cache measurements).
     pub fn clear_readers(&self) {
-        self.readers.lock().unwrap().clear();
+        self.readers.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 

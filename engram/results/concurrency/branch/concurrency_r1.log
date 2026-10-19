@@ -1,0 +1,26 @@
+== 100000 records
+  store: 1 readers: read p50 2.74 p99 5.59 ms, 349 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 1 readers + writer: read p50 2.93 p99 6.21 ms, 319 reads/s; 748 appends, p50 2.82 p99 6.82 ms
+  store: 2 readers: read p50 3.29 p99 7.01 ms, 569 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 2 readers + writer: read p50 3.65 p99 7.73 ms, 506 reads/s; 660 appends, p50 3.89 p99 14.44 ms
+  store: 4 readers: read p50 5.00 p99 10.05 ms, 751 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 4 readers + writer: read p50 5.33 p99 10.42 ms, 703 reads/s; 610 appends, p50 5.98 p99 11.69 ms
+  daemon: 1 prompt clients: prompt p50 4.38 p99 8.40 ms, 220 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 102201 records
+  daemon: 1 prompt clients + tool hooks: prompt p50 4.77 p99 8.91 ms, 200 prompts/s; 922 tool hooks, p50 0.37 p99 2.94 ms; 103854 records
+  daemon: 2 prompt clients: prompt p50 6.57 p99 13.27 ms, 292 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 102925 records
+  daemon: 2 prompt clients + tool hooks: prompt p50 6.97 p99 13.74 ms, 274 prompts/s; 861 tool hooks, p50 0.70 p99 6.19 ms; 104470 records
+  daemon: 4 prompt clients: prompt p50 10.95 p99 26.46 ms, 339 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 103172 records
+  daemon: 4 prompt clients + tool hooks: prompt p50 11.69 p99 27.12 ms, 321 prompts/s; 786 tool hooks, p50 1.92 p99 11.60 ms; 104083 records
+== 1000000 records
+  store: 1 readers: read p50 8.20 p99 24.17 ms, 112 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 1 readers + writer: read p50 8.82 p99 25.98 ms, 102 reads/s; 717 appends, p50 3.03 p99 10.02 ms
+  store: 2 readers: read p50 12.22 p99 30.02 ms, 156 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 2 readers + writer: read p50 12.47 p99 31.40 ms, 152 reads/s; 693 appends, p50 3.24 p99 11.91 ms
+  store: 4 readers: read p50 18.72 p99 42.50 ms, 201 reads/s; 0 appends, p50 0.00 p99 0.00 ms
+  store: 4 readers + writer: read p50 19.07 p99 44.17 ms, 196 reads/s; 718 appends, p50 2.75 p99 11.21 ms
+  daemon: 1 prompt clients: prompt p50 10.55 p99 28.82 ms, 87 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 1000881 records
+  daemon: 1 prompt clients + tool hooks: prompt p50 11.30 p99 29.62 ms, 82 prompts/s; 907 tool hooks, p50 0.37 p99 4.28 ms; 1002651 records
+  daemon: 2 prompt clients: prompt p50 15.19 p99 33.45 ms, 125 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 1001265 records
+  daemon: 2 prompt clients + tool hooks: prompt p50 17.50 p99 37.76 ms, 107 prompts/s; 841 tool hooks, p50 0.52 p99 8.06 ms; 1002766 records
+  daemon: 4 prompt clients: prompt p50 23.52 p99 55.11 ms, 157 prompts/s; 0 tool hooks, p50 0.00 p99 0.00 ms; 1001589 records
+  daemon: 4 prompt clients + tool hooks: prompt p50 25.47 p99 55.62 ms, 149 prompts/s; 836 tool hooks, p50 0.76 p99 8.24 ms; 1003173 records

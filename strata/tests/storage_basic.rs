@@ -594,10 +594,20 @@ fn table_without_primary_key() {
 /// and another merges; every snapshot is a committed state.
 #[test]
 fn readers_see_consistent_snapshots_during_writes_and_merges() {
+    readers_during_writes_and_merges(false);
+}
+
+/// The same with snapshots built by the writer and published.
+#[test]
+fn readers_see_published_snapshots_during_writes_and_merges() {
+    readers_during_writes_and_merges(true);
+}
+
+fn readers_during_writes_and_merges(publish_snapshots: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db.strata");
     let src = Arc::new(MapSource::default());
-    let o = DbOptions { memtable_max_docs: 64, ..opts(&src) };
+    let o = DbOptions { memtable_max_docs: 64, publish_snapshots, ..opts(&src) };
     let db = Arc::new(Database::create(&path, schema(), o).unwrap());
     let done = Arc::new(AtomicBool::new(false));
     const TXNS: u64 = 150;
@@ -647,20 +657,95 @@ fn readers_see_consistent_snapshots_during_writes_and_merges() {
     db.check().unwrap();
 }
 
+/// With published snapshots, every write returns with its version built
+/// and handed to readers: a reader gets that one (the same one each time)
+/// and does not wait for a transaction in progress.
+#[test]
+fn published_snapshots_follow_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.strata");
+    let src = Arc::new(MapSource::default());
+    let o = DbOptions { publish_snapshots: true, memtable_chunk_docs: 64, ..opts(&src) };
+    let db = Database::create(&path, schema(), o.clone()).unwrap();
+    assert_eq!(db.snapshot().n_live_docs(), 0);
+    let ids = |s: &Snapshot| s.segments().iter().map(|v| v.id).collect::<Vec<_>>();
+    let mut tx = db.begin().unwrap();
+    for i in 0..100 {
+        src.put(&doc(i, 0));
+        tx.insert(doc(i, 0)).unwrap();
+    }
+    tx.commit().unwrap();
+    let s1 = db.snapshot();
+    assert_keys(&s1, &keys(0..100));
+    assert_eq!(ids(&db.snapshot()), ids(&s1));
+    assert_eq!(db.snapshot().txn(), s1.txn());
+    // A reader during a transaction sees the last commit, without waiting.
+    let mut tx = db.begin().unwrap();
+    src.put(&doc(100, 0));
+    tx.insert(doc(100, 0)).unwrap();
+    std::thread::scope(|sc| sc.spawn(|| assert_keys(&db.snapshot(), &keys(0..100))).join().unwrap());
+    tx.commit().unwrap();
+    let s2 = db.snapshot();
+    assert_keys(&s2, &keys(0..101));
+    assert_eq!(ids(&s1)[0], ids(&s2)[0], "a full chunk is not rebuilt");
+    assert_keys(&s1, &keys(0..100));
+    // Flushes, bulk loads, merges and vacuums publish too.
+    db.flush().unwrap();
+    assert!(db.snapshot().segments().iter().all(|v| !v.in_memory));
+    db.bulk_load((200..300).map(|i| {
+        src.put(&doc(i, 0));
+        doc(i, 0)
+    }))
+    .unwrap();
+    let mut want = keys(0..101);
+    want.extend(keys(200..300));
+    assert_keys(&db.snapshot(), &want);
+    let mut tx = db.begin().unwrap();
+    for i in 0..50 {
+        tx.delete(&Value::Str(key(i))).unwrap();
+        want.remove(&key(i));
+    }
+    tx.commit().unwrap();
+    db.flush().unwrap();
+    db.merge(&MergePolicy { merge_factor: 2, floor_docs: 1000, ..MergePolicy::default() }).unwrap();
+    assert_eq!(db.snapshot().segments().len(), 1);
+    assert_keys(&db.snapshot(), &want);
+    db.vacuum().unwrap();
+    assert_keys(&db.snapshot(), &want);
+    db.check().unwrap();
+    // Reopening publishes the version recovered from the WAL.
+    let mut tx = db.begin().unwrap();
+    src.put(&doc(400, 0));
+    tx.insert(doc(400, 0)).unwrap();
+    tx.commit().unwrap();
+    want.insert(key(400));
+    drop(db);
+    let db = Database::open(&path, o).unwrap();
+    assert_keys(&db.snapshot(), &want);
+}
+
 /// Random transactions, flushes, merges and reopens against a model.
 #[test]
 fn random_operations_match_model() {
     for seed in 0..6 {
-        random_operations(seed);
+        random_operations(seed, false);
     }
 }
 
-fn random_operations(seed: u64) {
+/// The same with published snapshots.
+#[test]
+fn random_operations_match_model_with_published_snapshots() {
+    for seed in 0..3 {
+        random_operations(seed, true);
+    }
+}
+
+fn random_operations(seed: u64, publish_snapshots: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db.strata");
     let src = Arc::new(MapSource::default());
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let o = DbOptions { memtable_max_docs: 150, memtable_chunk_docs: 64, segment_max_docs: 120, ..opts(&src) };
+    let o = DbOptions { memtable_max_docs: 150, memtable_chunk_docs: 64, segment_max_docs: 120, publish_snapshots, ..opts(&src) };
     let policy = MergePolicy { merge_factor: 3, floor_docs: 40, max_deleted_ratio: 0.4, ..MergePolicy::default() };
     let mut db = Some(Database::create(&path, schema(), o.clone()).unwrap());
     let mut model: BTreeSet<String> = BTreeSet::new();

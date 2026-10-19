@@ -10,6 +10,10 @@
 //!   pages, `fsync`, then the other meta slot, `fsync`.
 //! * Readers never take the writer lock; the state lock is held only to
 //!   copy pointers, never across I/O or index builds.
+//! * With [`DbOptions::publish_snapshots`] the writer also builds each new
+//!   version's snapshot before its commit returns, and readers only clone
+//!   the published one: they never build a memtable segment or wait for
+//!   one to be built.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -17,7 +21,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -79,6 +83,12 @@ pub struct DbOptions {
     /// positions (graph, float32 vectors, norms, dictionaries, doc store,
     /// keys) `MADV_RANDOM`, keeping read-ahead for scanned sections.
     pub random_hints: bool,
+    /// Build each version's snapshot when it is made, in the writer (a
+    /// commit, flush, bulk load, merge or vacuum returns once readers can
+    /// see it), and give readers that one. A reader then never builds a
+    /// memtable segment or waits for another reader's build; each write
+    /// pays for the build instead of the first query after it.
+    pub publish_snapshots: bool,
 }
 
 impl Default for DbOptions {
@@ -93,6 +103,7 @@ impl Default for DbOptions {
             doc_source: None,
             read_ahead: true,
             random_hints: true,
+            publish_snapshots: false,
         }
     }
 }
@@ -136,6 +147,8 @@ pub struct Database {
     state: Mutex<State>,
     /// Serialises memtable segment builds, so concurrent readers build once.
     build_lock: Mutex<()>,
+    /// The snapshot readers get, with `DbOptions::publish_snapshots`.
+    published: RwLock<Option<Snapshot>>,
     merge_lock: Mutex<()>,
     pins: Arc<Pins>,
     mem_ids: AtomicU64,
@@ -234,7 +247,7 @@ impl Database {
         if flushed && st.mem.len == 0 && st.pending.is_empty() {
             wal.reset(opts.sync)?;
         }
-        Ok(Database {
+        let db = Database {
             path: path.to_path_buf(),
             wal_path,
             opts,
@@ -243,11 +256,14 @@ impl Database {
             writer: Mutex::new(wal),
             state: Mutex::new(st),
             build_lock: Mutex::new(()),
+            published: RwLock::new(None),
             merge_lock: Mutex::new(()),
             pins: Arc::new(Pins::default()),
             mem_ids: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
-        })
+        };
+        db.republish();
+        Ok(db)
     }
 
     pub fn schema(&self) -> &Schema {
@@ -271,9 +287,23 @@ impl Database {
     }
 
     /// The current version. Never waits for a writer; the first snapshot
-    /// after a write rebuilds the last memtable chunk's segment.
+    /// after a write rebuilds the last memtable chunk's segment, unless
+    /// `DbOptions::publish_snapshots` has the writer build it.
     pub fn snapshot(&self) -> Snapshot {
+        if let Some(s) = &*self.published.read().unwrap_or_else(|e| e.into_inner()) {
+            return s.clone();
+        }
         self.snapshot_inner(true)
+    }
+
+    /// With `publish_snapshots`, builds the current version's snapshot and
+    /// hands it to readers from now on. Callers hold the writer lock (or
+    /// are opening the database), so versions are published in order.
+    fn republish(&self) {
+        if self.opts.publish_snapshots {
+            let s = self.snapshot_inner(true);
+            *self.published.write().unwrap_or_else(|e| e.into_inner()) = Some(s);
+        }
     }
 
     /// A snapshot without the memtable (merges read only on-disk segments).
@@ -633,18 +663,21 @@ impl Database {
             })
             .collect::<Result<Vec<_>>>()
             .map_err(|e| self.poison(e))?;
-        let mut st = lock(&self.state);
-        st.txn = c.meta.txn;
-        st.manifest = c.manifest;
-        st.meta = c.meta;
-        st.slot = c.slot;
-        st.freelist = c.fl;
-        st.file_pages = c.file_pages;
-        st.map = map;
-        st.handles = handles;
-        st.live_cache.clear();
-        update(&mut st);
-        st.changed();
+        {
+            let mut st = lock(&self.state);
+            st.txn = c.meta.txn;
+            st.manifest = c.manifest;
+            st.meta = c.meta;
+            st.slot = c.slot;
+            st.freelist = c.fl;
+            st.file_pages = c.file_pages;
+            st.map = map;
+            st.handles = handles;
+            st.live_cache.clear();
+            update(&mut st);
+            st.changed();
+        }
+        self.republish();
         Ok(())
     }
 
@@ -680,8 +713,15 @@ impl Database {
             st.mem.len + st.n_pending > self.opts.memtable_max_docs
         };
         if full {
-            self.flush_locked(wal)?;
+            // The flush publishes its version; if it fails, the transaction
+            // is committed all the same and must be visible.
+            let r = self.flush_locked(wal);
+            if r.is_err() {
+                self.republish();
+            }
+            return r;
         }
+        self.republish();
         Ok(())
     }
 }

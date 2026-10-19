@@ -128,6 +128,9 @@ pub struct Daemon {
     dirty: std::sync::atomic::AtomicBool,
     /// Background work still running (distillation); shutdown waits for it.
     pending: std::sync::atomic::AtomicUsize,
+    /// Held while state.json is written, so an older state never lands
+    /// after a newer one.
+    saving: Mutex<()>,
     /// Distillations run one at a time, so each sees what the last wrote.
     distilling: Mutex<()>,
     /// Turns distilled since the notes were last consolidated.
@@ -152,12 +155,18 @@ impl Daemon {
         let embedder: Arc<dyn embed::Embedder> = Arc::from(embed::open(&cfg.embedder)?);
         let store = Arc::new(Store::open(&paths.db, embedder, StoreOptions { sync: cfg.sync, ..Default::default() })?);
         let state: State = std::fs::read_to_string(&paths.state).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        Ok(Daemon { paths, project: project.to_string(), store, cfg, state: Mutex::new(state), dirty: Default::default(), pending: Default::default(),
+        Ok(Daemon { paths, project: project.to_string(), store, cfg, state: Mutex::new(state), dirty: Default::default(), pending: Default::default(), saving: Mutex::new(()),
             distilling: Mutex::new(()), distilled_since: Default::default(), deep_jobs: Mutex::new(HashMap::new()), from_hooks: Mutex::new((String::new(), None)), last_activity: AtomicI64::new(now()) })
     }
 
-    fn save_state(&self, st: &State) {
-        let mut st2 = State { sessions: st.sessions.clone(), active: st.active.clone() };
+    /// Writes the session state: copied under the session lock, written
+    /// outside it, so a hook never waits for the file.
+    fn save_state(&self) {
+        let _one = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st2 = {
+            let st = self.state.lock().unwrap();
+            State { sessions: st.sessions.clone(), active: st.active.clone() }
+        };
         if st2.sessions.len() > 64 {
             let mut by: Vec<(String, i64)> = st2.sessions.iter().map(|(k, v)| (k.clone(), v.last_seen)).collect();
             by.sort_by_key(|x| -x.1);
@@ -175,8 +184,7 @@ impl Daemon {
     /// Writes the session state if it changed.
     pub fn persist(&self) {
         if self.dirty.swap(false, Ordering::AcqRel) {
-            let st = self.state.lock().unwrap();
-            self.save_state(&st);
+            self.save_state();
         }
     }
 
@@ -233,8 +241,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(200));
         }
         let _ = self.store.flush();
-        let st = self.state.lock().unwrap();
-        self.save_state(&st);
+        self.save_state();
         let _ = std::fs::remove_file(&self.paths.socket);
         std::process::exit(0);
     }
@@ -808,12 +815,12 @@ impl Daemon {
         // when the gate holds back the rest: a request that does not sound
         // like earlier work can still be bound by what was agreed.
         // The two searches are independent (only packing needs both), so
-        // they run side by side.
-        let (known, searched) = std::thread::scope(|sc| {
-            let k = sc.spawn(|| if self.cfg.knowledge.enabled { recall::knowledge(&self.store, &query, &filter, &skip, &self.cfg.knowledge) } else { Ok(Vec::new()) });
-            let m = recall::search(&self.store, &query, &filter, &self.cfg.rank);
-            (k.join().unwrap_or_else(|_| Err(crate::err("knowledge search panicked"))), m)
-        });
+        // they run side by side when a core is free, on one snapshot.
+        let store = self.store.pinned();
+        let (known, searched) = recall::both(
+            || if self.cfg.knowledge.enabled { recall::knowledge(&store, &query, &filter, &skip, &self.cfg.knowledge) } else { Ok(Vec::new()) },
+            || recall::search(&store, &query, &filter, &self.cfg.rank),
+        );
         let known = known?;
         let (hits, ev) = searched?;
         let mut ids: Vec<String> = known.iter().map(|(r, _, _)| r.id.clone()).collect();
@@ -929,8 +936,9 @@ impl Daemon {
         let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let before = req.get("before").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
         let after = req.get("after").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-        let rec = self.store.get(&[id.to_string()])?.pop().ok_or_else(|| err(format!("no record {id}")))?;
-        let near = self.store.range(&rec.session, rec.seq - 200, rec.seq + 200)?;
+        let store = self.store.pinned();
+        let rec = store.get(&[id.to_string()])?.pop().ok_or_else(|| err(format!("no record {id}")))?;
+        let near = store.range(&rec.session, rec.seq - 200, rec.seq + 200)?;
         let at = near.iter().position(|r| r.id == rec.id).unwrap_or(0);
         let lo = at.saturating_sub(before);
         let hi = (at + after + 1).min(near.len());
