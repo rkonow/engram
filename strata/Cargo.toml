@@ -27,7 +27,7 @@ roaring = "0.11.5"
 clap = { version = "4", features = ["derive"] }
 rust-stemmers = "1.2"
 # MEDIA values (`media`): bytes given as base64.
-base64 = "0.22"
+base64 = "0.23"
 # SQLite (bundled, with FTS5): importing and exporting SQLite databases
 # (feature `sqlite`, `strata::sqlite`) and the SQLite baseline (`baselines`).
 rusqlite = { version = "0.40", features = ["bundled", "functions"], optional = true }
