@@ -269,7 +269,7 @@ dependencies = [
  "num-traits",
  "num_cpus",
  "rand 0.9.5",
- "rand_distr 0.5.1",
+ "rand_distr",
  "rayon",
  "safetensors",
  "thiserror 2.0.21",
@@ -806,7 +806,7 @@ dependencies = [
  "half",
  "num-traits",
  "rand 0.9.5",
- "rand_distr 0.5.1",
+ "rand_distr",
 ]
 
 [[package]]
@@ -1051,7 +1051,7 @@ dependencies = [
  "crunchy",
  "num-traits",
  "rand 0.9.5",
- "rand_distr 0.5.1",
+ "rand_distr",
  "zerocopy",
 ]
 
@@ -1692,16 +1692,6 @@ dependencies = [
 
 [[package]]
 name = "rand_distr"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
-dependencies = [
- "num-traits",
- "rand 0.8.8",
-]
-
-[[package]]
-name = "rand_distr"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
@@ -2092,7 +2082,7 @@ dependencies = [
  "lz4_flex 0.11.6",
  "memmap2",
  "rand 0.8.8",
- "rand_distr 0.4.3",
+ "rand_distr",
  "roaring",
  "rusqlite",
  "rust-stemmers",
