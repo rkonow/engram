@@ -105,6 +105,26 @@ impl Sq8 {
         let q8 = w.iter().map(|&x| if alpha > 0.0 { (x / alpha).round().clamp(-127.0, 127.0) as i8 } else { 0 }).collect();
         Sq8Query { q8, w, alpha, bias: bias as f32 }
     }
+
+    /// [`Sq8::prepare`] without the float32 weights, for [`Sq8Query::dot`]
+    /// only: graph construction prepares one per insert and per neighbour
+    /// it compares candidates with.
+    pub fn prepare_int8(&self, q: &[f32], stride: usize) -> Sq8Query {
+        let mut bias = 0f64;
+        let mut max = 0f32;
+        for j in 0..self.dim() {
+            max = max.max((q[j] * self.scale[j]).abs());
+            bias += q[j] as f64 * self.min[j] as f64;
+        }
+        let alpha = max / 127.0;
+        let mut q8 = vec![0i8; stride];
+        if alpha > 0.0 {
+            for j in 0..self.dim() {
+                q8[j] = ((q[j] * self.scale[j]) / alpha).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        Sq8Query { q8, w: Vec::new(), alpha, bias: bias as f32 }
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +177,7 @@ mod tests {
             assert!((exact - approx).abs() < 0.02, "exact {exact} approx {approx}");
             assert!((exact - asym).abs() < 0.02, "exact {exact} asym {asym}");
         }
+        let q8 = sq.prepare_int8(&q, dim);
+        assert_eq!((q8.q8, q8.alpha, q8.bias), (qc.q8.clone(), qc.alpha, qc.bias));
     }
 }

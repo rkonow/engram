@@ -1,7 +1,9 @@
 //! Merged HNSW graphs start from an input's graph: its nodes keep their
 //! levels and links and only the other documents are inserted (Lucene's
-//! merge, from 9.9). The graph started from must cover documents with the
-//! same vectors; one that does not fit is ignored.
+//! merge, from 9.9); the other inputs' graphs are joined to it (Lucene
+//! 10.2). A graph started from must cover documents with the same vectors;
+//! one that does not fit is ignored. Construction scores with SQ8 codes
+//! unless `vector.hnsw.build` is `f32`.
 
 use std::sync::Arc;
 
@@ -116,6 +118,45 @@ fn a_graph_that_does_not_fit_is_ignored() {
         let start = [GraphStart { field: 1, segment: seg, base }];
         assert!(build_segment_from(&schema(16), &all, &opts(1), &start).unwrap() == plain);
     }
+}
+
+#[test]
+fn a_merge_joins_its_other_inputs_graphs() {
+    let vectors = clustered(8000, 8);
+    let queries = clustered(200, 9);
+    let all = docs(&vectors, 0..8000);
+    let inputs: Vec<SegmentFile> = (0..4).map(|s| segment(build_segment(&schema(16), &docs(&vectors, s * 2000..(s + 1) * 2000), &opts(1)).unwrap())).collect();
+    let starts: Vec<GraphStart> = inputs.iter().enumerate().map(|(s, seg)| GraphStart { field: 1, segment: seg.clone(), base: (s * 2000) as u32 }).collect();
+    let joined = build_segment_from(&schema(16), &all, &opts(1), &starts).unwrap();
+    let largest = build_segment_from(&schema(16), &all, &opts(1), &starts[..1]).unwrap();
+    let whole = segment(build_segment(&schema(16), &all, &opts(1)).unwrap());
+    // The joined inputs change the graph, the same way every time.
+    assert!(joined != largest);
+    assert!(build_segment_from(&schema(16), &all, &opts(1), &starts).unwrap() == joined);
+    let (with, without) = (recall(&segment(joined), &queries), recall(&whole, &queries));
+    assert!(with >= 0.9 && with >= without - 0.02, "recall@10 joined {with:.3}, built whole {without:.3}");
+    // A graph that does not fit among them is left out: the same graph as
+    // without it.
+    let mut odd = starts.clone();
+    odd.insert(2, GraphStart { field: 1, segment: segment(build_segment(&schema(8), &docs(&vectors, 4000..6000), &opts(1)).unwrap()), base: 4000 });
+    odd.remove(3);
+    let mut fit = starts.clone();
+    fit.remove(2);
+    assert!(build_segment_from(&schema(16), &all, &opts(1), &odd).unwrap() == build_segment_from(&schema(16), &all, &opts(1), &fit).unwrap());
+}
+
+#[test]
+fn graphs_built_on_codes_find_neighbours_as_well() {
+    let vectors = clustered(6000, 10);
+    let queries = clustered(200, 11);
+    let all = docs(&vectors, 0..6000);
+    let codes = build_segment(&schema(16), &all, &opts(1)).unwrap();
+    let f32 = build_segment(&schema(16), &all, &opts(1).set("vector.hnsw.build", "f32")).unwrap();
+    assert!(codes != f32);
+    let (c, f) = (recall(&segment(codes), &queries), recall(&segment(f32), &queries));
+    assert!(c >= 0.9 && c >= f - 0.02, "recall@10 built on codes {c:.3}, on float32 {f:.3}");
+    let err = build_segment(&schema(16), &all, &opts(1).set("vector.hnsw.build", "bf16")).unwrap_err().to_string();
+    assert!(err.contains("vector.hnsw.build"), "{err}");
 }
 
 #[test]

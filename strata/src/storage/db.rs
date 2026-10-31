@@ -2509,25 +2509,26 @@ impl Database {
             }
             Ok(out)
         };
-        // The merged vector graphs start from the largest input's, if it
-        // lost no documents and keeps its order.
+        // The merged vector graphs start from the largest input's and join
+        // the other inputs' graphs to it, of the inputs that lost no
+        // documents and keep their order.
         let mut starts = Vec::new();
         let mut base = 0u32;
-        let mut largest: Option<(usize, &SegmentFile, u32)> = None;
+        let mut whole: Vec<(usize, &SegmentFile, u32)> = Vec::new();
         for (k, (_, live)) in inputs.iter().enumerate() {
             let v = views[k];
-            if !clustered && live.len() == v.file.n_docs() && largest.is_none_or(|(n, ..)| live.len() > n) {
-                largest = Some((live.len(), &v.file, base));
+            if !clustered && live.len() == v.file.n_docs() {
+                whole.push((live.len(), &v.file, base));
             }
             base += live.len() as u32;
         }
-        if let Some((_, seg, base)) = largest {
-            for (i, f) in schema.fields.iter().enumerate() {
-                // A multi-vector field numbers its vectors apart from the
-                // rows, so its graph is built anew.
-                if matches!(f.ty, FieldType::Vector { .. }) && !f.multi {
-                    starts.push(GraphStart { field: i, segment: seg.clone(), base });
-                }
+        // Largest first (the first of equals): its graph keeps its links.
+        whole.sort_by_key(|&(n, _, base)| (std::cmp::Reverse(n), base));
+        for (i, f) in schema.fields.iter().enumerate() {
+            // A multi-vector field numbers its vectors apart from the rows,
+            // so its graph is built anew.
+            if matches!(f.ty, FieldType::Vector { .. }) && !f.multi {
+                starts.extend(whole.iter().map(|&(_, seg, base)| GraphStart { field: i, segment: seg.clone(), base }));
             }
         }
         // The merged documents' sequence numbers, as the snapshot has them;

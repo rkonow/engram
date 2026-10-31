@@ -1,13 +1,20 @@
-//! A merge's vector graph built whole against started from its largest
-//! input's graph: build time and recall@10 against an exact scan, on unit
-//! vectors around 100 random centres.
+//! A merge's vector graph built whole, started from its largest input's
+//! graph (Lucene 9.9), and started from it with the other inputs' graphs
+//! joined (Lucene 10.2): build time and recall@10 against an exact scan.
 //!
 //! ```text
 //! graph_start DIM SEGMENTS DOCS_PER_SEGMENT [KEY=VALUE ...]
+//! graph_start beir:NAME SEGMENTS DOCS_PER_SEGMENT [KEY=VALUE ...]
 //! ```
 //!
-//! `KEY=VALUE` pairs are build options, such as `vector.threads=4`. The
-//! inputs are equal in size, as the tiered policy merges them.
+//! With a number, the vectors are unit vectors around 100 random centres;
+//! with `beir:NAME`, the first documents of a collection prepared under
+//! `STRATA_DATA` (`doc_vecs.f32`, `query_vecs.f32`, `meta.json`), and as
+//! queries its queries and the 500 documents after those indexed (a BEIR
+//! collection can have as few as 50 queries). `KEY=VALUE` pairs are build options, such as
+//! `vector.threads=4` or `vector.hnsw.build=f32`. The inputs are equal in
+//! size, as the tiered policy merges them.
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,6 +42,13 @@ fn clustered(n: usize, rng: &mut impl Rng, centres: &[Vec<f32>]) -> Vec<Vec<f32>
         .collect()
 }
 
+/// The first `n` rows of a file of float32 rows of `dim` values.
+fn rows(path: &std::path::Path, dim: usize, n: usize) -> Vec<Vec<f32>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).unwrap().take((n * dim * 4) as u64).read_to_end(&mut bytes).unwrap();
+    bytes.chunks_exact(dim * 4).map(|r| r.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()).collect()
+}
+
 fn recall(seg: &SegmentFile, queries: &[Vec<f32>], ef: usize) -> f64 {
     // Field emb, the table's second (id 1), names its sections f1.
     let r = VectorReader::open(seg, "f1").unwrap();
@@ -49,31 +63,45 @@ fn recall(seg: &SegmentFile, queries: &[Vec<f32>], ef: usize) -> f64 {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (dim, segs, per): (usize, usize, usize) = (a[1].parse().unwrap(), a[2].parse().unwrap(), a[3].parse().unwrap());
+    let (segs, per): (usize, usize) = (a[2].parse().unwrap(), a[3].parse().unwrap());
     let mut opts = BuildOptions::default();
     for kv in &a[4..] {
         let (k, v) = kv.split_once('=').expect("KEY=VALUE");
         opts = opts.set(k, v);
     }
-    let mut rng = rand::rngs::StdRng::seed_from_u64(1);
-    let centres: Vec<Vec<f32>> = (0..100).map(|_| (0..dim).map(|_| gaussian(&mut rng)).collect()).collect();
-    let vectors = clustered(segs * per, &mut rng, &centres);
-    let queries = clustered(200, &mut rng, &centres);
+    let (dim, vectors, queries) = match a[1].strip_prefix("beir:") {
+        Some(name) => {
+            let dir = strata::data::data_dir().join(name);
+            let meta: serde_json::Value = serde_json::from_reader(std::fs::File::open(dir.join("meta.json")).unwrap()).unwrap();
+            let dim = meta["dim"].as_u64().unwrap() as usize;
+            let mut vectors = rows(&dir.join("doc_vecs.f32"), dim, segs * per + 500);
+            assert_eq!(vectors.len(), segs * per + 500, "the collection has fewer documents");
+            let mut queries = rows(&dir.join("query_vecs.f32"), dim, 500);
+            queries.extend(vectors.split_off(segs * per));
+            (dim, vectors, queries)
+        }
+        None => {
+            let dim: usize = a[1].parse().unwrap();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+            let centres: Vec<Vec<f32>> = (0..100).map(|_| (0..dim).map(|_| gaussian(&mut rng)).collect()).collect();
+            let vectors = clustered(segs * per, &mut rng, &centres);
+            (dim, vectors, clustered(200, &mut rng, &centres))
+        }
+    };
     let schema = Schema::new("t", vec![Field::new("id", FieldType::Int), Field::new("emb", FieldType::Vector { dim, index: DEFAULT_HNSW })], Some("id")).unwrap();
     let docs: Vec<Vec<Value>> = vectors.iter().enumerate().map(|(i, v)| vec![Value::Int(i as i64), Value::Vector(Arc::from(v.as_slice()))]).collect();
-    let first = SegmentFile::from_vec(build_segment(&schema, &docs[..per], &opts).unwrap()).unwrap();
     let t = Instant::now();
-    let whole = SegmentFile::from_vec(build_segment(&schema, &docs, &opts).unwrap()).unwrap();
-    let whole_s = t.elapsed().as_secs_f64();
-    let t = Instant::now();
-    let start = [GraphStart { field: 1, segment: first, base: 0 }];
-    let started = SegmentFile::from_vec(build_segment_from(&schema, &docs, &opts, &start).unwrap()).unwrap();
-    let started_s = t.elapsed().as_secs_f64();
-    println!(
-        "{dim}-dim, {segs} x {per}: whole {whole_s:.2} s, recall@10 ef 64 {:.3}, ef 100 {:.3}; started {started_s:.2} s, recall@10 ef 64 {:.3}, ef 100 {:.3}",
-        recall(&whole, &queries, 64),
-        recall(&whole, &queries, 100),
-        recall(&started, &queries, 64),
-        recall(&started, &queries, 100)
-    );
+    let inputs: Vec<SegmentFile> = (0..segs).map(|s| SegmentFile::from_vec(build_segment(&schema, &docs[s * per..(s + 1) * per], &opts).unwrap()).unwrap()).collect();
+    let inputs_s = t.elapsed().as_secs_f64() / segs as f64;
+    let starts: Vec<GraphStart> = inputs.iter().enumerate().map(|(s, seg)| GraphStart { field: 1, segment: seg.clone(), base: (s * per) as u32 }).collect();
+    let timed = |starts: &[GraphStart]| {
+        let t = Instant::now();
+        let seg = SegmentFile::from_vec(build_segment_from(&schema, &docs, &opts, starts).unwrap()).unwrap();
+        (t.elapsed().as_secs_f64(), recall(&seg, &queries, 64), recall(&seg, &queries, 100))
+    };
+    println!("{dim}-dim, {segs} x {per} ({} queries), an input {inputs_s:.2} s", queries.len());
+    for (name, s) in [("whole", &starts[..0]), ("largest", &starts[..1]), ("joined", &starts[..])] {
+        let (secs, r64, r100) = timed(s);
+        println!("  {name:8} {secs:7.2} s, recall@10 ef 64 {r64:.3}, ef 100 {r100:.3}");
+    }
 }

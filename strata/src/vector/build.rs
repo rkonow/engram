@@ -11,6 +11,7 @@
 //! | `vector.ivf.sample` | 64 | k-means training points per cluster |
 //! | `vector.hnsw.m` | schema's `m` (16) | links per node (2·M on layer 0) |
 //! | `vector.hnsw.ef_construction` | schema's (200) | construction beam width |
+//! | `vector.hnsw.build` | `sq8` with SQ8 codes | `sq8`: construction scores with the codes, as search does; `f32`: with float32 rows |
 //! | `vector.threads` | 1 | threads for k-means and graph construction |
 //! | `vector.seed` | fixed | seed for sampling and HNSW levels |
 //!
@@ -56,7 +57,7 @@ pub(crate) fn strides(dim: usize) -> (usize, usize) {
 enum Kind {
     Flat,
     Ivf { nlist: Option<usize>, iters: usize, sample: usize },
-    Hnsw { m: usize, ef_construction: usize },
+    Hnsw { m: usize, ef_construction: usize, f32: bool },
 }
 
 fn parse<T: std::str::FromStr>(opts: &BuildOptions, key: &str) -> Result<Option<T>> {
@@ -75,9 +76,10 @@ pub(crate) struct VectorBuilder {
     hnsw_max_docs: Option<usize>,
     threads: usize,
     seed: u64,
-    /// A segment whose graph this one's starts from, and the docID its
-    /// first document has here ([`hnsw::StartGraph`]).
-    start: Option<(SegmentFile, u32)>,
+    /// Segments whose graphs this one's starts from, and the docID each
+    /// one's first document has here ([`hnsw::StartGraph`]); the first that
+    /// fits keeps its links, the others are joined to it.
+    start: Vec<(SegmentFile, u32)>,
     /// Float32 rows as little-endian bytes, so the buffer becomes the
     /// section without a copy.
     rows: Vec<u8>,
@@ -118,6 +120,11 @@ impl VectorBuilder {
             "hnsw" => Kind::Hnsw {
                 m: parse(opts, "vector.hnsw.m")?.unwrap_or(schema_m),
                 ef_construction: parse(opts, "vector.hnsw.ef_construction")?.unwrap_or(schema_ef),
+                f32: match opts.get("vector.hnsw.build") {
+                    None | Some("sq8") => false,
+                    Some("f32") => true,
+                    Some(b) => return Err(Error::Schema(format!("bad value {b:?} for build option vector.hnsw.build (sq8 or f32)"))),
+                },
             },
             other => return Err(Error::Schema(format!("unknown vector index {other:?}"))),
         };
@@ -133,7 +140,7 @@ impl VectorBuilder {
             hnsw_max_docs: parse(opts, "vector.hnsw.max_docs")?,
             threads: parse(opts, "vector.threads")?.unwrap_or(1),
             seed: parse(opts, "vector.seed")?.unwrap_or(0x5EE_D0F5_747A),
-            start: None,
+            start: Vec::new(),
             rows: Vec::new(),
             present: Vec::new(),
             n: 0,
@@ -144,10 +151,12 @@ impl VectorBuilder {
 }
 
 impl VectorBuilder {
-    /// Starts the field's HNSW graph from `seg`'s, whose documents are this
-    /// build's from docID `base` on, all of them with the same vectors.
-    pub fn start_from(mut self, seg: SegmentFile, base: u32) -> Self {
-        self.start = Some((seg, base));
+    /// Starts the field's HNSW graph from the graphs of `segs`, whose
+    /// documents are this build's from each one's docID `base` on, all of
+    /// them with the same vectors: the first that fits keeps its links and
+    /// the others are joined to it.
+    pub fn start_from(mut self, segs: Vec<(SegmentFile, u32)>) -> Self {
+        self.start = segs;
         self
     }
 }
@@ -221,7 +230,7 @@ impl FieldIndexBuilder for VectorBuilder {
             k => k,
         };
         // A merge's graph is a graph of rows, not of a multi-vector field's vectors.
-        let start = if multi.is_some() { None } else { start };
+        let start = if multi.is_some() { Vec::new() } else { start };
         // SAFETY: f32 has no invalid bit patterns; `align_to` only yields the
         // aligned middle part, and we require it to be everything.
         let (head, data, tail) = unsafe { rows.align_to::<f32>() };
@@ -271,10 +280,14 @@ impl FieldIndexBuilder for VectorBuilder {
                 index_sections.push((section(&field, "ivf_dir"), built.dir_bytes()));
                 index_sections.push((section(&field, "ivf"), built.lists));
             }
-            Kind::Hnsw { m, ef_construction } => {
-                let start = start.and_then(|(seg, base)| Some((start_graph(&seg, &field, dim)?, base)));
-                let start = start.as_ref().map(|((g, n), base)| hnsw::StartGraph { view: g, base: *base, n: *n });
-                let g = hnsw::build(&view, &is_present, &HnswConfig { m, ef_construction, threads, seed }, start.as_ref());
+            Kind::Hnsw { m, ef_construction, f32 } => {
+                let graphs: Vec<((HnswView, usize), u32)> = start.iter().filter_map(|(seg, base)| Some((start_graph(seg, &field, dim)?, *base))).collect();
+                let starts: Vec<hnsw::StartGraph> = graphs.iter().map(|((g, n), base)| hnsw::StartGraph { view: g, base: *base, n: *n }).collect();
+                let on = match &quant {
+                    Quantiser::Sq8(sq8) if !f32 => Some(hnsw::BuildCodes { sq8, codes: &codes, stride: code_stride }),
+                    _ => None,
+                };
+                let g = hnsw::build(&view, &is_present, &HnswConfig { m, ef_construction, threads, seed }, &starts, on.as_ref());
                 info.index = "hnsw".into();
                 info.m = Some(g.m);
                 info.ef_construction = Some(ef_construction);

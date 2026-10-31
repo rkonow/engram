@@ -123,8 +123,9 @@ pub fn build_segment(schema: &Schema, docs: &[Document], opts: &BuildOptions) ->
 
 /// A vector field's HNSW graph to start a build from: `segment`'s graph of
 /// the field, whose documents are the build's from docID `base` on, all of
-/// them, with the same vectors. A merge starts from its largest input that
-/// lost no documents.
+/// them, with the same vectors. A merge names every input that lost no
+/// documents, the largest first: the first graph that fits keeps its links
+/// and the others are joined to it.
 #[derive(Clone)]
 pub struct GraphStart {
     pub field: usize,
@@ -183,10 +184,10 @@ impl<'a> SegmentBuild<'a> {
                 FieldType::Sparse if f.indexed => Some(Slot::Index(crate::text::sparse::field_builder(f, opts)?)),
                 FieldType::Keyword | FieldType::Int | FieldType::Float if f.indexed => Some(Slot::Index(crate::forward::field_builder(f, opts)?)),
                 // Vector fields always store their vectors; `indexed` adds the ANN index.
-                FieldType::Vector { .. } => Some(Slot::Index(match starts.iter().find(|g| g.field == i) {
-                    Some(g) => crate::vector::field_builder_from(f, opts, g.segment.clone(), g.base)?,
-                    None => crate::vector::field_builder(f, opts)?,
-                })),
+                FieldType::Vector { .. } => {
+                    let from: Vec<_> = starts.iter().filter(|g| g.field == i).map(|g| (g.segment.clone(), g.base)).collect();
+                    Some(Slot::Index(if from.is_empty() { crate::vector::field_builder(f, opts)? } else { crate::vector::field_builder_from(f, opts, from)? }))
+                }
                 FieldType::Edges if f.indexed => Some(Slot::Graph(crate::graph::keyless_builder(f, schema)?)),
                 _ => None,
             };

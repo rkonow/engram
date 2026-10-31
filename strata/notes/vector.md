@@ -140,6 +140,7 @@ without a filter is the plain index search.
 | `vector.ivf.sample` | 64 | training points per list |
 | `vector.hnsw.m` | schema's `m` (16) | layer 0 has 2·M |
 | `vector.hnsw.ef_construction` | schema's (200) | |
+| `vector.hnsw.build` | `sq8` with SQ8 codes | `sq8`: construction scores with the codes, as search does; `f32`: with float32 rows |
 | `vector.threads` | 1 | k-means and graph construction |
 | `vector.seed` | fixed | sample, HNSW levels |
 
@@ -348,12 +349,42 @@ for every index strategy on segments without that index.
 
 * **Construction**: hnswlib's algorithm (heuristic neighbour selection,
   2·M links on layer 0, per-node locks, levels from a seeded hash so the
-  layer structure does not depend on the thread count), float32 distances.
-  Inserts are memory-latency bound (4 KiB per vector, random): prefetching
+  layer structure does not depend on the thread count). Inserts are
+  memory-latency bound (4 KiB per float32 vector, random): prefetching
   the next neighbour's vector cut FiQA's build from 50.5 s to 33.5 s
   (prefetching in the selection heuristic and link shrinking was neutral).
-  Build with 2 threads under load: FiQA 54 s, TREC-COVID 113 s, Quora
-  593 s.
+  Build with 2 threads under load, float32 distances: FiQA 54 s,
+  TREC-COVID 113 s, Quora 593 s.
+* **Construction on SQ8 codes** (`vector.hnsw.build`, default `sq8`): the
+  inserted vector is prepared as a query (int8 weights, as searches are)
+  and scored against the others' codes, a byte per dimension; the
+  selection heuristic prepares each neighbour it keeps the same way.
+  TREC-COVID, 4 threads, idle container: 36.6 s against 82.0 s on float32
+  rows, recall@10 within 0.014 at every ef from 10 to 256 (one run each).
+  At 64 dimensions it saves nothing (a float32 row is 256 bytes, and
+  preparing a query per kept neighbour costs about what it saves).
+* **Merges** start from the inputs' graphs (`GraphStart`). The largest
+  input that lost no documents keeps its levels and links (Lucene 9.9);
+  every other whole input is joined to it (Lucene 10.2's
+  `MergingHnswGraphBuilder`): a join set covering its graph (greedy, each
+  node needing `max(2, ⌈degree/4⌉)` neighbours in the set, Lucene's
+  `UpdateGraphsUtils.computeJoinSet`) is inserted as usual, then every
+  other node searches layer 0 from its old neighbours already inserted
+  (the join set, and the nodes before it) and their new neighbours. Four
+  TREC-COVID segments of 25,000 (1,024 dimensions, 4 threads, 50 queries
+  and 500 held-out documents, `examples/graph_start.rs`):
+
+  | layer-0 beam of the other nodes | seeds | seconds | recall@10 ef 64 | ef 100 |
+  |---|---|---|---|---|
+  | `min(ef/2, 3M)` = 48 (Lucene) | join set | 10.3 | 0.984 | 0.991 |
+  | `min(ef/2, 3M)` = 48 | join set and nodes before | 10.1 | 0.983 | 0.991 |
+  | `ef/2` = 100 | join set | 12.1 | 0.988 | 0.992 |
+  | `ef/2` = 100 (kept) | join set and nodes before | 12.0 | 0.990 | 0.995 |
+  | largest input's graph only | | 15.9 | 0.991 | 0.995 |
+  | from scratch | | 20.4 | 0.989 | 0.993 |
+
+  One run each on codes; float32 rows: 20.9 to 21.1 s joined, 29.6 to
+  30.0 s from the largest, 37.9 s from scratch.
 * **Search on SQ8 codes** (1 KiB per hop instead of 4 KiB), four neighbours
   per VNNI call, then float32 re-ranking; `ef = max(ef, rerank)`. Default
   ef 64: recall 0.984 (FiQA), 0.988 (TREC-COVID), 0.991 (Quora) at 90–175
@@ -529,11 +560,14 @@ copy; the segment is streamed to the file with `write_to`).
 
 ## Open issues
 
-* **HNSW construction** is the slowest build step (TREC-COVID 113 s with 2
-  threads, Quora 593 s). It uses float32 distances on 4 KiB
-  vectors and is memory-latency bound; building on SQ8 codes or BF16
-  (AVX512-BF16 is present) would cut the traffic 2–4×, at some graph
-  quality. The 4-thread final run will roughly halve it.
+* **HNSW construction** is still the slowest build step. On SQ8 codes it
+  reads a quarter of the bytes (2.2× faster on TREC-COVID); preparing a
+  query per kept neighbour in the selection heuristic is now a large part
+  of an insert, and caching those, or comparing neighbours code to code,
+  would cut it further. Joining a merge's inputs' graphs is 1.3× faster
+  than starting from the largest alone (1.4× on float32 rows; with the
+  codes, 2.4× faster than float32 from the largest), but the nodes of
+  inputs that lost documents are still inserted from scratch.
 * **IVF centroid scan.** Every IVF query scores all `nlist` centroids:
   Quora's 2893 SQ8 centroids (2.9 MB, past L2) cost ~170 µs, most of a
   query at nprobe ≤ 8 (nprobe 1: 205 µs). A small HNSW over the centroids,

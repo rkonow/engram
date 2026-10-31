@@ -60,6 +60,9 @@ struct Args {
     m: usize,
     #[arg(long, default_value_t = 200)]
     ef_construction: usize,
+    /// What HNSW construction scores with: `sq8` codes or `f32` rows.
+    #[arg(long, default_value = "sq8")]
+    hnsw_build: String,
     #[arg(long, default_value = "1,2,4,8,16,32,64,128")]
     nprobe: String,
     #[arg(long, default_value = "10,16,24,32,48,64,96,128,256")]
@@ -347,7 +350,8 @@ fn build(ds: &Dataset, kind: &str, a: &Args, path: &Path) -> Json {
         .set("vector.index", kind)
         .set("vector.threads", a.threads)
         .set("vector.hnsw.m", a.m)
-        .set("vector.hnsw.ef_construction", a.ef_construction);
+        .set("vector.hnsw.ef_construction", a.ef_construction)
+        .set("vector.hnsw.build", &a.hnsw_build);
     if let Some(nl) = a.nlist {
         opts = opts.set("vector.ivf.nlist", nl);
     }
@@ -369,7 +373,7 @@ fn build(ds: &Dataset, kind: &str, a: &Args, path: &Path) -> Json {
     f.into_inner().unwrap().sync_all().unwrap();
     let write_secs = t.elapsed().as_secs_f64();
     println!("{kind}: built in {build_secs:.1}s (written in {write_secs:.1}s, {:.1} MiB), peak RSS {:.0} MiB", bytes as f64 / 1048576.0, peak_rss_mb());
-    json!({"build_secs": build_secs, "write_secs": write_secs, "file_bytes": bytes, "threads": a.threads, "peak_rss_mb": peak_rss_mb()})
+    json!({"build_secs": build_secs, "write_secs": write_secs, "file_bytes": bytes, "threads": a.threads, "hnsw_build": a.hnsw_build, "peak_rss_mb": peak_rss_mb()})
 }
 
 fn open(path: &Path) -> (SegmentFile, VectorReader) {

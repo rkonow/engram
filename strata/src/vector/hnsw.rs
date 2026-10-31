@@ -1,12 +1,22 @@
 //! HNSW: hierarchical navigable small-world graph (Malkov & Yashunin).
 //!
 //! **Construction** inserts documents in docID order (in a seeded random
-//! order with several threads) with exact float32 similarities, the
-//! neighbour-selection heuristic, `M` links per node on the upper layers and
-//! `2M` on layer 0. Several threads insert at once; each node's link list has
-//! its own lock, as in hnswlib. Levels come from a seeded hash of the docID,
-//! so the layer structure does not depend on the thread count (the links do,
-//! slightly, through insertion races).
+//! order with several threads) with the neighbour-selection heuristic, `M`
+//! links per node on the upper layers and `2M` on layer 0. Several threads
+//! insert at once; each node's link list has its own lock, as in hnswlib.
+//! Levels come from a seeded hash of the docID, so the layer structure does
+//! not depend on the thread count (the links do, slightly, through insertion
+//! races). Similarities are those a search uses: the inserted vector's
+//! float32 values against the others' SQ8 codes ([`BuildCodes`]), a quarter
+//! of the memory traffic of float32 rows; a field with binary codes builds on
+//! float32.
+//!
+//! **Merges** keep the graph of their largest input that lost no documents
+//! (Lucene 9.9) and join the other whole inputs' graphs to it as Lucene 10.2
+//! does: a greedy cover of each one's nodes (its *join set*, about a quarter
+//! of each node's neighbours) is inserted as usual, and every other node
+//! starts its layer-0 search from its old neighbours in the join set and
+//! their new neighbours, with a narrower beam.
 //!
 //! **Layout** (sections `vec.<field>.hnsw` and `vec.<field>.hnsw_upper`):
 //! layer 0 is `n × 2M` u32 neighbour ids, padded with `u32::MAX`, so a node's
@@ -33,7 +43,7 @@
 
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::postings::bytes::{ByteReader, ByteWriter, OwnedBytes, Slice};
@@ -43,6 +53,7 @@ use crate::segment::DocId;
 use crate::vector::build::Rows;
 use crate::vector::kernels::{self, dot_f32};
 use crate::vector::codes::QueryCode;
+use crate::vector::sq8::{Sq8, Sq8Query};
 use crate::vector::topk::{Members, TopK};
 use crate::vector::{io, Codes, SearchStats};
 
@@ -112,17 +123,43 @@ fn level_of(i: u32, seed: u64, m: usize) -> usize {
     ((-u.ln() / (m as f64).ln()).floor() as usize).min(MAX_LEVEL)
 }
 
+/// SQ8 codes to build on: `codes` holds row `v`'s at `v * stride`.
+pub(crate) struct BuildCodes<'a> {
+    pub sq8: &'a Sq8,
+    pub codes: &'a [u8],
+    pub stride: usize,
+}
+
+impl BuildCodes<'_> {
+    fn row(&self, v: u32) -> &[u8] {
+        &self.codes[v as usize * self.stride..(v as usize + 1) * self.stride]
+    }
+}
+
+/// A vector prepared for scoring others during construction.
+enum Probe<'a> {
+    F32(&'a [f32]),
+    Sq8(Sq8Query),
+}
+
 struct Builder<'a> {
     rows: &'a Rows<'a>,
+    codes: Option<&'a BuildCodes<'a>>,
     m: usize,
     m0: usize,
     ef: usize,
+    /// The beam of a layer-0 search started from a joined node's old
+    /// neighbours: half the beam (Lucene caps it at 3M, which lost recall
+    /// on TREC-COVID, notes/vector.md).
+    ef_seeded: usize,
     levels: Vec<u8>,
     /// links[v][l]: node v's neighbours on layer l (empty for absent docs).
     links: Vec<Vec<Mutex<Vec<u32>>>>,
     entry: Mutex<(u32, usize)>,
     /// Held by an insert whose level exceeds the current top level.
     grow: Mutex<()>,
+    /// Whether each node's insert has finished.
+    done: Vec<AtomicBool>,
 }
 
 struct Scratch {
@@ -149,22 +186,48 @@ impl Builder<'_> {
         self.rows.row(v as usize)
     }
 
-    /// Vectors are 4 KiB at 1024 dimensions and scattered: callers start
-    /// fetching the next one while scoring the current one.
+    /// `v` prepared for scoring the others.
+    fn probe(&self, v: u32) -> Probe<'_> {
+        match self.codes {
+            None => Probe::F32(self.row(v)),
+            Some(c) => Probe::Sq8(c.sq8.prepare_int8(self.row(v), c.stride)),
+        }
+    }
+
+    /// Similarity of `p` with `v`: exact, or of `p`'s float32 values with
+    /// `v`'s codes.
+    fn score(&self, p: &Probe, v: u32) -> f32 {
+        match (p, self.codes) {
+            (Probe::Sq8(q), Some(c)) => q.score(q.dot(c.row(v))),
+            (Probe::F32(q), _) => dot_f32(q, self.row(v)),
+            (Probe::Sq8(_), None) => unreachable!("probes match the builder"),
+        }
+    }
+
+    /// Vectors are 4 KiB at 1024 dimensions (1 KiB as codes) and scattered:
+    /// callers start fetching the next one while scoring the current one.
     fn prefetch(&self, v: u32) {
-        let r = self.row(v);
-        kernels::prefetch(r.as_ptr() as *const u8, r.len() * 4);
+        match self.codes {
+            None => {
+                let r = self.row(v);
+                kernels::prefetch(r.as_ptr() as *const u8, r.len() * 4);
+            }
+            Some(c) => {
+                let r = c.row(v);
+                kernels::prefetch(r.as_ptr(), r.len());
+            }
+        }
     }
 
     fn neighbours(&self, v: u32, l: usize) -> Vec<u32> {
         self.links[v as usize][l].lock().unwrap().clone()
     }
 
-    fn greedy(&self, q: &[f32], mut cur: Scored, l: usize) -> Scored {
+    fn greedy(&self, q: &Probe, mut cur: Scored, l: usize) -> Scored {
         loop {
             let mut changed = false;
             for nb in self.neighbours(cur.1, l) {
-                let s = dot_f32(q, self.row(nb));
+                let s = self.score(q, nb);
                 if s > cur.0 {
                     cur = Scored(s, nb);
                     changed = true;
@@ -177,7 +240,7 @@ impl Builder<'_> {
     }
 
     /// The `ef` nodes closest to `q` on layer `l` reachable from `eps`, best first.
-    fn search_layer(&self, q: &[f32], eps: &[Scored], ef: usize, l: usize, sc: &mut Scratch) -> Vec<Scored> {
+    fn search_layer(&self, q: &Probe, eps: &[Scored], ef: usize, l: usize, sc: &mut Scratch) -> Vec<Scored> {
         let epoch = sc.next_epoch();
         let mut cand: BinaryHeap<Scored> = BinaryHeap::new();
         let mut res: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
@@ -185,6 +248,9 @@ impl Builder<'_> {
             sc.visited[e.1 as usize] = epoch;
             cand.push(e);
             res.push(Reverse(e));
+        }
+        while res.len() > ef {
+            res.pop();
         }
         while let Some(c) = cand.pop() {
             if res.len() >= ef && c < res.peek().unwrap().0 {
@@ -196,7 +262,7 @@ impl Builder<'_> {
                 if let Some(&next) = fresh.get(i + 1) {
                     self.prefetch(next);
                 }
-                let s = Scored(dot_f32(q, self.row(nb)), nb);
+                let s = Scored(self.score(q, nb), nb);
                 if res.len() < ef || s > res.peek().unwrap().0 {
                     cand.push(s);
                     res.push(Reverse(s));
@@ -215,6 +281,7 @@ impl Builder<'_> {
     /// to every neighbour already kept, which spreads links across directions.
     fn select(&self, cands: &[Scored], m: usize) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::with_capacity(m);
+        let mut kept: Vec<Probe> = Vec::with_capacity(m);
         for (i, c) in cands.iter().enumerate() {
             if out.len() >= m {
                 break;
@@ -222,9 +289,11 @@ impl Builder<'_> {
             if let Some(next) = cands.get(i + 1) {
                 self.prefetch(next.1);
             }
-            let cv = self.row(c.1);
-            if out.iter().all(|&r| dot_f32(cv, self.row(r)) <= c.0) {
+            if kept.iter().all(|r| self.score(r, c.1) <= c.0) {
                 out.push(c.1);
+                if out.len() < m {
+                    kept.push(self.probe(c.1));
+                }
             }
         }
         out
@@ -237,21 +306,23 @@ impl Builder<'_> {
             g.push(new);
             return;
         }
-        let ev = self.row(e);
+        let ev = self.probe(e);
         let ids: Vec<u32> = g.iter().copied().chain([new]).collect();
         let mut cands: Vec<Scored> = Vec::with_capacity(ids.len());
         for (i, &x) in ids.iter().enumerate() {
             if let Some(&next) = ids.get(i + 1) {
                 self.prefetch(next);
             }
-            cands.push(Scored(dot_f32(ev, self.row(x)), x));
+            cands.push(Scored(self.score(&ev, x), x));
         }
         cands.sort_unstable_by(|a, b| b.cmp(a));
         *g = self.select(&cands, cap);
     }
 
-    fn insert(&self, i: u32, sc: &mut Scratch) {
-        let q = self.row(i);
+    /// Inserts `i`; a non-empty `seeds` starts its layer-0 search instead of
+    /// the layer above's result, with the narrower beam.
+    fn insert(&self, i: u32, seeds: &[u32], sc: &mut Scratch) {
+        let q = self.probe(i);
         let level = self.levels[i as usize] as usize;
         let (mut ep, mut top) = *self.entry.lock().unwrap();
         let _grow = if level > top {
@@ -261,13 +332,24 @@ impl Builder<'_> {
         } else {
             None
         };
-        let mut cur = Scored(dot_f32(q, self.row(ep)), ep);
+        let mut cur = Scored(self.score(&q, ep), ep);
         for l in (level + 1..=top).rev() {
-            cur = self.greedy(q, cur, l);
+            cur = self.greedy(&q, cur, l);
         }
         let mut eps = vec![cur];
         for l in (0..=level.min(top)).rev() {
-            let w = self.search_layer(q, &eps, self.ef, l, sc);
+            let w = if l == 0 && !seeds.is_empty() {
+                let mut from = Vec::with_capacity(seeds.len());
+                for (j, &s) in seeds.iter().enumerate() {
+                    if let Some(&next) = seeds.get(j + 1) {
+                        self.prefetch(next);
+                    }
+                    from.push(Scored(self.score(&q, s), s));
+                }
+                self.search_layer(&q, &from, self.ef_seeded, 0, sc)
+            } else {
+                self.search_layer(&q, &eps, self.ef, l, sc)
+            };
             let sel = self.select(&w, self.m);
             *self.links[i as usize][l].lock().unwrap() = sel.clone();
             for e in sel {
@@ -283,7 +365,8 @@ impl Builder<'_> {
 
 /// A graph to start a build from: `view`'s node `v` is the build's node
 /// `base + v`, with the same vector (a merge's input that lost no
-/// documents).
+/// documents). The first one given that fits keeps its links; the others
+/// that fit are joined to it.
 pub(crate) struct StartGraph<'a> {
     pub view: &'a HnswView,
     pub base: u32,
@@ -311,17 +394,101 @@ impl StartGraph<'_> {
         }
         levels
     }
+
+    fn range(&self) -> std::ops::Range<u32> {
+        self.base..self.base + self.n as u32
+    }
+
+    /// Lucene's join set (10.2, `UpdateGraphsUtils.computeJoinSet`): nodes
+    /// taken greedily by how much they cover, until each node is in the set
+    /// or has `k` of its layer-0 neighbours in it, `k` a quarter of its
+    /// neighbours (two below nine). Gains are recomputed lazily, as Lucene
+    /// does, so the cover is close to that, not exact.
+    fn join_set(&self) -> Vec<bool> {
+        let n = self.n;
+        let nbrs = |v: u32| self.view.neighbours(v, 0);
+        let need: Vec<u32> = (0..n as u32)
+            .map(|v| {
+                let d = nbrs(v).len();
+                (if d < 9 { 2 } else { d.div_ceil(4) }).min(d) as u32
+            })
+            .collect();
+        let goal: u64 = need.iter().map(|&k| k as u64).sum();
+        let (mut counts, mut j, mut stale) = (vec![0u32; n], vec![false; n], vec![false; n]);
+        let mut heap: BinaryHeap<(u32, Reverse<u32>)> = (0..n as u32).map(|v| (need[v as usize] + nbrs(v).len() as u32, Reverse(v))).collect();
+        let mut got = 0u64;
+        while got < goal {
+            let Some((gain, Reverse(v))) = heap.pop() else { break };
+            let vi = v as usize;
+            if stale[vi] {
+                stale[vi] = false;
+                let g = need[vi].saturating_sub(counts[vi]) + nbrs(v).iter().filter(|&&u| !j[u as usize] && counts[u as usize] < need[u as usize]).count() as u32;
+                if g > 0 {
+                    heap.push((g, Reverse(v)));
+                }
+                continue;
+            }
+            j[vi] = true;
+            got += gain as u64;
+            for &u in nbrs(v) {
+                let ui = u as usize;
+                stale[ui] = true;
+                counts[ui] += 1;
+                if counts[ui] == need[ui] {
+                    for &w in nbrs(u) {
+                        stale[w as usize] = true;
+                    }
+                }
+            }
+        }
+        j
+    }
 }
 
-/// Builds the graph over the present rows. Started from a graph that
-/// fits, its nodes keep their levels and links and only the other rows are
-/// inserted, as Lucene does when merging (from 9.9): a merge of four
-/// segments of one size inserts three quarters of its rows.
-pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &HnswConfig, start: Option<&StartGraph>) -> Graph {
+/// A graph joined to the one the build starts from, and its join set.
+struct Joined<'a> {
+    start: &'a StartGraph<'a>,
+    join: Vec<bool>,
+}
+
+impl Joined<'_> {
+    /// Build node `i`'s seeds: its old neighbours already in the graph
+    /// being built (the join set and the nodes inserted before it, as in
+    /// Lucene) and their neighbours there.
+    fn seeds(&self, b: &Builder, i: u32) -> Vec<u32> {
+        let s = self.start;
+        let mut out = Vec::new();
+        for &v in s.view.neighbours(i - s.base, 0) {
+            if self.join[v as usize] || b.done[(s.base + v) as usize].load(Ordering::Acquire) {
+                out.push(s.base + v);
+                out.extend(b.neighbours(s.base + v, 0));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Builds the graph over the present rows, scoring with `codes` if given.
+/// Started from graphs that fit, the first one's nodes keep their levels
+/// and links, as Lucene does when merging (from 9.9), and the others are
+/// joined to it (Lucene 10.2): their join sets are inserted as usual, their
+/// other nodes from seeds.
+pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &HnswConfig, starts: &[StartGraph], codes: Option<&BuildCodes>) -> Graph {
     let n = rows.n;
     let (m, m0) = (cfg.m.max(2), 2 * cfg.m.max(2));
-    let start = start.filter(|s| s.view.entry != NONE && s.fits(present, n, m));
-    let started = |i: u32| start.is_some_and(|s| (s.base..s.base + s.n as u32).contains(&i));
+    let mut fitting: Vec<&StartGraph> = Vec::new();
+    for s in starts {
+        if s.view.entry != NONE && s.fits(present, n, m) && fitting.iter().all(|f| f.range().end <= s.base || s.range().end <= f.base) {
+            fitting.push(s);
+        }
+    }
+    let start = fitting.first().copied();
+    let joined: Vec<Joined> = fitting.iter().skip(1).map(|&s| Joined { start: s, join: s.join_set() }).collect();
+    let started = |i: u32| start.is_some_and(|s| s.range().contains(&i));
+    // Build node `i`'s joined graph and whether it is in that graph's join set.
+    let joined_at = |i: u32| joined.iter().find(|j| j.start.range().contains(&i)).map(|j| (j, j.join[(i - j.start.base) as usize]));
     let mut levels: Vec<u8> = (0..n as u32).map(|i| if present(i) { level_of(i, cfg.seed, m) as u8 } else { 0 }).collect();
     if let Some(s) = start {
         levels[s.base as usize..s.base as usize + s.n].copy_from_slice(&s.levels());
@@ -343,15 +510,19 @@ pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &H
     let Some(first) = first else {
         return Graph { m, entry: NONE, max_level: 0, layer0: vec![NONE; n * m0], upper: Vec::new() };
     };
+    let ef = cfg.ef_construction.max(m);
     let b = Builder {
         rows,
+        codes,
         m,
         m0,
-        ef: cfg.ef_construction.max(m),
+        ef,
+        ef_seeded: (ef / 2).max(m),
         levels,
         links,
         entry: Mutex::new((first, 0)),
         grow: Mutex::new(()),
+        done: (0..n).map(|_| AtomicBool::new(false)).collect(),
     };
     *b.entry.lock().unwrap() = (first, b.levels[first as usize] as usize);
     // Concurrent inserts cannot see each other. In docID order, threads
@@ -360,26 +531,39 @@ pub(crate) fn build(rows: &Rows, present: &(dyn Fn(u32) -> bool + Sync), cfg: &H
     // neighbours) those pairs end up unlinked: 4 threads cut recall@10 at ef
     // 64 from 0.86 to 0.77 on MS MARCO passages (notes/scale.md). A seeded
     // permutation makes concurrent inserts unrelated.
-    let mut order: Vec<u32> = (0..n as u32).filter(|&i| i != first && present(i) && !started(i)).collect();
+    // The joined graphs' nodes outside their join sets go in last, from
+    // seeds among the nodes already in.
+    let (mut order, mut seeded): (Vec<u32>, Vec<u32>) =
+        (0..n as u32).filter(|&i| i != first && present(i) && !started(i)).partition(|&i| joined_at(i).is_none_or(|(_, in_join)| in_join));
     if cfg.threads > 1 {
         use rand::{seq::SliceRandom, SeedableRng};
-        order.shuffle(&mut rand::rngs::StdRng::seed_from_u64(cfg.seed));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+        order.shuffle(&mut rng);
+        seeded.shuffle(&mut rng);
     }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..cfg.threads.max(1) {
-            s.spawn(|| {
-                let mut sc = Scratch::new(n);
-                loop {
-                    let j = next.fetch_add(1, Ordering::Relaxed);
-                    if j >= order.len() {
-                        break;
+    for (pass, ids) in [order, seeded].iter().enumerate() {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..cfg.threads.max(1) {
+                s.spawn(|| {
+                    let mut sc = Scratch::new(n);
+                    loop {
+                        let j = next.fetch_add(1, Ordering::Relaxed);
+                        if j >= ids.len() {
+                            break;
+                        }
+                        let i = ids[j];
+                        let seeds = match (pass, joined_at(i)) {
+                            (1, Some((g, _))) => g.seeds(&b, i),
+                            _ => Vec::new(),
+                        };
+                        b.insert(i, &seeds, &mut sc);
+                        b.done[i as usize].store(true, Ordering::Release);
                     }
-                    b.insert(order[j], &mut sc);
-                }
-            });
-        }
-    });
+                });
+            }
+        });
+    }
     let (entry, max_level) = *b.entry.lock().unwrap();
     let mut layer0 = vec![NONE; n * m0];
     for (v, l) in b.links.iter().enumerate() {
