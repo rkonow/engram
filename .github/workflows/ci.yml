@@ -53,7 +53,7 @@ jobs:
     outputs:
       code: ${{ steps.diff.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Changed files
         id: diff
         env:
@@ -97,7 +97,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -142,7 +142,7 @@ jobs:
     env:
       RUSTFLAGS: -C target-cpu=x86-64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # A generic build runs on any x86-64 runner: no CPU model in the key.
       - uses: Swatinem/rust-cache@v2
@@ -168,7 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -202,7 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -239,7 +239,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: CPU model
         id: cpu
@@ -263,7 +263,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: CPU model
         id: cpu
@@ -272,7 +272,7 @@ jobs:
         with:
           workspaces: strata
           key: relevance-${{ steps.cpu.outputs.model }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/beir
           key: beir-${{ hashFiles('strata/tests/fixtures/beir/fetch.sh') }}
@@ -293,7 +293,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: CPU model
         id: cpu
@@ -302,11 +302,11 @@ jobs:
         with:
           workspaces: strata
           key: relevance-bert-${{ steps.cpu.outputs.model }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/beir
           key: beir-${{ hashFiles('strata/tests/fixtures/beir/fetch.sh') }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/models
           key: cross-encoder-${{ hashFiles('strata/tests/models/fetch_cross_encoder.sh') }}
@@ -343,7 +343,7 @@ jobs:
           - part: columns, graph, keys, text codec
             tests: "forward:: graph:: storage::pk::tests::collisions storage::pk::tests::section_written storage::live storage::updates::tests::round_trip text::codec --skip many_int_keys"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-10-27
@@ -366,7 +366,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -421,11 +421,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: CPU model
