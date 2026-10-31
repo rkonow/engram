@@ -28,6 +28,7 @@ each score on [0, 1] first, the weighted fusion of the two.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from typing import Any, Iterable, Mapping, Sequence
 
 from ._strata import StrataError
@@ -51,6 +52,8 @@ __all__ = [
     "rrf",
     "ranked",
     "minmax",
+    "tmm",
+    "zscore",
     "rank",
     "gbdt",
     "cross_encoder",
@@ -810,6 +813,43 @@ def minmax(x: Expr) -> Expr:
     minmax() of scores is their weighted fusion."""
     x = _num(x)
     return _Ranked("minmax", [x], lambda ctx, a: {"norm": {"kind": "min_max", "input": a[0]}}, f"minmax({x!r})")
+
+
+def tmm(x: Expr, lo: float | None = None, hi: float | None = None) -> Expr:
+    """Theoretical min-max: (x - lo) / (max - lo), where `lo` is the least
+    value `x` can take (0 for bm25(), -1 for similarity(); give it for any
+    other) and `max` the largest over the rows it ranks; 0 where `x` is
+    NULL. A row's value does not depend on how deep the candidates go,
+    as minmax()'s does. With `hi` too the bounds are fixed: (x - lo) /
+    (hi - lo), each row's own value. `0.3 * tmm(bm25(...)) + 0.7 *
+    tmm(similarity(...))` is the convex fusion Bruch et al. (TOIS 2023)
+    find best."""
+    x = _num(x)
+    for name, b in (("lo", lo), ("hi", hi)):
+        if b is not None and not (isinstance(b, (int, float)) and math.isfinite(b)):
+            raise StrataError(f"tmm's {name} is a finite number, not {b!r}")
+    shown = f"tmm({x!r}{'' if lo is None else f', lo={lo!r}'}{'' if hi is None else f', hi={hi!r}'})"
+    if hi is not None:
+        if lo is None:
+            raise StrataError("tmm(x, hi=...) needs lo too: the bounds are fixed together")
+        if hi <= lo:
+            raise StrataError(f"tmm's hi ({hi}) must be above its lo ({lo})")
+        return coalesce((x - lo) / (hi - lo), 0)
+
+    def build(ctx: _Ctx, a: list) -> Any:
+        n = {"kind": "tmm", "input": a[0]}
+        if lo is not None:
+            n["lo"] = float(lo)
+        return {"norm": n}
+
+    return _Ranked("tmm", [x], build, shown)
+
+
+def zscore(x: Expr) -> Expr:
+    """`x` centred and scaled over the rows it ranks: (x - mean) / sd, 0
+    where all are equal; a row where `x` is NULL takes the least value."""
+    x = _num(x)
+    return _Ranked("zscore", [x], lambda ctx, a: {"norm": {"kind": "z_score", "input": a[0]}}, f"zscore({x!r})")
 
 
 def rank(x: Expr) -> Expr:

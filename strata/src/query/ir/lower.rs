@@ -283,7 +283,7 @@ impl Lower<'_> {
             Score::Arith { op, left, right } => Expr::Arith { op: *op, left: Box::new(self.score(left)), right: Box::new(self.score(right)) },
             Score::Neg(x) => Expr::Neg(Box::new(self.score(x))),
             Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.score(a)).collect() },
-            Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.score(input)) },
+            Score::Norm { kind, input, lo } => Expr::Norm { kind: *kind, input: Box::new(self.score(input)), lo: *lo },
             Score::Gbdt { model, hash, args, open } => Expr::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(|a| self.score(a)).collect(), open: open.clone() },
             Score::CrossEncoder { model, hash, fields, query, open } => {
                 Expr::CrossEncoder { model: model.clone(), hash: hash.clone(), fields: fields.iter().map(|&f| f as u32).collect(), query: query.clone(), open: open.clone() }

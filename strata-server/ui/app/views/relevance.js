@@ -3,8 +3,13 @@
 // in this browser) and the measures they give each ranking: nDCG, the
 // share of good rows, the first good row. A set of queries with grades
 // compares the rankings over all of them, and a weighted hybrid's weight
-// is tuned by trying eleven. The ranking that wins can be kept with its
-// table as a rank profile.
+// (or rank fusion's k) is tuned by trying each over the set. The ranking
+// that wins can be kept with its table as a rank profile.
+//
+// A weighted hybrid normalises each score with tmm() by default: theoretical
+// min-max, which Bruch, Gai and Ingber (TOIS 2023) find fuses better than
+// RRF once its one weight is tuned on a few graded queries; minmax() and
+// zscore() are there to compare.
 
 import { h, s, icon, clear, fmt, api, store, toast, modal, empty, seg, sqlBlock, debounce, failure, showTip, hideTip } from "../core.js";
 import { tables, table as tableOf, invalidate } from "../catalog.js";
@@ -13,9 +18,12 @@ import { quoteName } from "../sqledit.js";
 export default { id: "relevance", title: "Relevance lab", icon: "relevance", group: "Tune", full: true, keywords: "relevance ranking compare a/b judgments ndcg mrr precision tune weights hybrid fusion rrf bm25 vector rank profile evaluation", render };
 
 const PRESETS = [
-  ["bm25", "Words (BM25)"], ["fuzzy", "Words, typos allowed"], ["vector", "Meaning (vectors)"], ["rrf", "Hybrid: rank fusion"],
-  ["weighted", "Hybrid: weighted"], ["boost", "Words boosted by a number"], ["profile", "A rank profile"], ["custom", "An expression"],
+  ["bm25", "Words (BM25)"], ["fuzzy", "Words, typos allowed"], ["vector", "Meaning (vectors)"], ["weighted", "Hybrid: weighted"],
+  ["rrf", "Hybrid: rank fusion"], ["boost", "Words boosted by a number"], ["profile", "A rank profile"], ["custom", "An expression"],
 ];
+// How a weighted hybrid puts each score on one scale.
+const NORMS = [["tmm", "tmm"], ["minmax", "minmax"], ["zscore", "zscore"]];
+const RRF_KS = [1, 5, 10, 20, 40, 60, 100];
 const COLORS = ["var(--s1)", "var(--s2)"];
 const GRADES = [[0, "bad"], [1, "fair"], [2, "good"], [3, "perfect"]];
 const ROW_H = 48;
@@ -72,7 +80,7 @@ function render(page) {
     const tf = fs.find((f) => f.type === "text" && f.indexed !== false)?.name, vf = fs.find((f) => f.type === "vector")?.name, nf = fs.find((f) => f.type === "int" || f.type === "float")?.name;
     const shown = fs.find((f) => f.type === "text" && f.stored !== false)?.name || t.short.key;
     return { table: t.table, shown, q: "", where: "", k: 10,
-      rankings: [{ preset: "bm25", field: tf, vfield: vf, nfield: nf, alpha: 0.5, w: 0.1, custom: "" }, { preset: vf ? "weighted" : "fuzzy", field: tf, vfield: vf, nfield: nf, alpha: 0.5, w: 0.1, custom: "" }] };
+      rankings: [{ preset: "bm25", field: tf, vfield: vf, nfield: nf, alpha: 0.3, norm: "tmm", k: 60, w: 0.1, custom: "" }, { preset: vf ? "weighted" : "fuzzy", field: tf, vfield: vf, nfield: nf, alpha: 0.3, norm: "tmm", k: 60, w: 0.1, custom: "" }] };
   }
 
   /** The ORDER BY of a ranking, and whether it reads the embedded text (:v). */
@@ -83,26 +91,26 @@ function render(page) {
       case "bm25": return `bm25(${F}, :q)`;
       case "fuzzy": return `bm25(${F}, :q, fuzzy => 'auto')`;
       case "vector": return `similarity(${V}, :v)`;
-      case "rrf": return `rrf(bm25(${F}, :q), similarity(${V}, :v))`;
-      case "weighted": return `${a} * minmax(bm25(${F}, :q)) + ${Math.round((1 - a) * 100) / 100} * minmax(similarity(${V}, :v))`;
+      case "rrf": return `rrf(bm25(${F}, :q), similarity(${V}, :v)${(r.k ?? 60) !== 60 ? `, k => ${r.k}` : ""})`;
+      case "weighted": { const n = r.norm || "tmm"; return `${a} * ${n}(bm25(${F}, :q)) + ${Math.round((1 - a) * 100) / 100} * ${n}(similarity(${V}, :v))`; }
       case "boost": return `bm25(${F}, :q) * (1 + ${r.w ?? 0.1} * coalesce(${N}, 0))`;
       case "profile": return `rank_profile('${(r.profile || "").replace(/'/g, "''")}', q => :q${/:v\b/.test(profileSql(r.profile)) ? ", v => :v" : ""})`;
       default: return r.custom || "";
     }
   }
   const profileSql = (name) => { const p = (tableOf(st.table)?.profiles || []).find((x) => x.name === name); return p ? JSON.stringify(p) : ""; };
-  function sqlOf(r, q = st.q, alpha) {
+  function sqlOf(r, q = st.q, over) {
     const t = tableOf(st.table);
     const key = t.short.key;
-    const e = expr(alpha != null ? { ...r, alpha } : r);
+    const e = expr(over ? { ...r, ...over } : r);
     const cols = [quoteName(key), st.shown && st.shown !== key ? quoteName(st.shown) : null, "score()", r.preset === "custom" ? null : "features()"].filter(Boolean).join(", ");
     const sql = `SELECT ${cols} FROM ${quoteName(t.table)}${st.where.trim() ? ` WHERE ${st.where}` : ""} ORDER BY ${e}${r.preset === "profile" ? "" : " DESC"} LIMIT ${st.k}`;
     const params = { q };
     if (/:v\b/.test(e)) params.v = r.vfield ? { embed: q, field: r.vfield } : { embed: q };
     return { sql, params };
   }
-  async function query(r, q, alpha) {
-    const { sql, params } = sqlOf(r, q, alpha);
+  async function query(r, q, over) {
+    const { sql, params } = sqlOf(r, q, over);
     const j = await api("/v1/query", { body: { sql, params } });
     const t = tableOf(st.table);
     const ki = j.columns.indexOf(t.short.key), ti = st.shown && st.shown !== t.short.key ? j.columns.indexOf(st.shown) : -1, si = j.columns.indexOf("score()");
@@ -159,7 +167,10 @@ function render(page) {
     if (["bm25", "fuzzy", "rrf", "weighted", "boost"].includes(r.preset)) ctl.append(fsel("field", textF(), "words in"));
     if (["vector", "rrf", "weighted"].includes(r.preset)) ctl.append(vecF().length ? fsel("vfield", vecF(), "meaning of") : h("span", { class: "small error" }, "no vector field"));
     if (r.preset === "boost") ctl.append(fsel("nfield", numF(), "boosted by"), slider(r, "w", 0, 1, 0.01, (v) => `× (1 + ${v} × ${r.nfield})`));
-    if (r.preset === "weighted") ctl.append(slider(r, "alpha", 0, 1, 0.05, (v) => `${fmt.pct(v, 0)} words · ${fmt.pct(1 - v, 0)} meaning`));
+    if (r.preset === "weighted") ctl.append(
+      h("select", { class: "select sm", title: "How each score is put on one scale: tmm divides by the best row's score from the least possible one (0 for words, -1 for meaning); minmax spans the rows found; zscore centres on their mean", onchange: (e) => { r.norm = e.target.value; save(); drawCompare(); run(); } }, NORMS.map(([v, l]) => h("option", { value: v, selected: v === (r.norm || "tmm") }, l))),
+      slider(r, "alpha", 0, 1, 0.05, (v) => `${fmt.pct(v, 0)} words · ${fmt.pct(1 - v, 0)} meaning`));
+    if (r.preset === "rrf") ctl.append(h("label", { class: "row nw small dim", title: "RRF's k: smaller trusts the top of each ranking more" }, "k", h("select", { class: "select sm", onchange: (e) => { r.k = Number(e.target.value); save(); run(); } }, RRF_KS.map((k) => h("option", { value: k, selected: k === (r.k ?? 60) }, k)))));
     if (r.preset === "profile") { const ps = tableOf(st.table)?.profiles || []; ctl.append(ps.length ? h("select", { class: "select sm", onchange: (e) => { r.profile = e.target.value; save(); run(); } }, ps.map((p) => h("option", { value: p.name, selected: p.name === r.profile }, p.name))) : h("span", { class: "small muted" }, `${st.table} has no rank profiles yet: save a ranking as one below.`)); if (!r.profile && ps[0]) r.profile = ps[0].name; }
     if (r.preset === "custom") { const ta = h("textarea", { class: "input mono sm", rows: 2, placeholder: "bm25(body, :q) * decay(year, 2026, 3)", value: r.custom, style: { width: "100%" }, oninput: (e) => { r.custom = e.target.value; save(); runSoon(); } }); ctl.append(ta); }
     const m = res?.rows ? measures(res.rows.map((x) => x.key), grades, st.k) : null;
@@ -247,7 +258,7 @@ function render(page) {
       }
       const mean = (side, k) => { const xs = per.map((p) => p[side][k]).filter((x) => x != null); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
       evalOut = { per, mean };
-      const weighted = st.rankings.findIndex((r) => r.preset === "weighted");
+      const tunable = st.rankings.map((r, i) => (r.preset === "weighted" || r.preset === "rrf") && r.field && r.vfield ? i : -1).filter((i) => i >= 0);
       clear(evalBox,
         h("section", { class: "card" }, h("div", { class: "hd" }, h("h3", {}, "Over the graded queries"), h("span", { class: "sub" }, `${fmt.plural(qs.length, "query", "queries")} · top ${st.k} · rows without a grade count as bad`)),
           h("div", { class: "bd" }, h("div", { class: "grid g2" },
@@ -255,7 +266,10 @@ function render(page) {
               h("div", { class: "row nw", style: { gap: "10px" } }, ["a", "b"].map((side, i) => h("span", { class: "row nw", style: { gap: "5px" } }, h("span", { class: "rl-letter sm", style: { "--c": COLORS[i] } }, "AB"[i]), h("b", {}, mean(side, k) == null ? "–" : k === "precision" ? fmt.pct(mean(side, k), 0) : mean(side, k).toFixed(3)))))))),
               wins(per)),
             h("div", {}, h("div", { class: "small dim", style: { marginBottom: "6px" } }, `nDCG@${st.k} of B minus A, a query a bar`), deltaChart(per))))),
-        weighted >= 0 ? h("section", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "hd" }, h("h3", {}, `Tune ${"AB"[weighted]}'s weight`), h("span", { class: "sub" }, "mean nDCG over the set at each share of words")), h("div", { class: "bd" }, sweepBox(weighted, qs))) : null);
+        tunable.map((i) => h("section", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "hd" },
+          h("h3", {}, st.rankings[i].preset === "rrf" ? `Tune ${"AB"[i]}'s k` : `Tune ${"AB"[i]}'s weight`),
+          h("span", { class: "sub" }, st.rankings[i].preset === "rrf" ? `mean nDCG over the set at each k (${qs.length < 20 ? "a few more graded queries make the choice firmer" : "fit on these queries"})` : `mean nDCG over the set at each share of words, ${st.rankings[i].norm || "tmm"} on both`)),
+          h("div", { class: "bd" }, sweepBox(i, qs)))));
     } catch (e) { clear(evalBox, h("div", { class: "error", style: { margin: "12px" } }, e.message)); }
   }
   function wins(per) {
@@ -271,39 +285,46 @@ function render(page) {
       h("span", { class: "v mono" }, (r.d >= 0 ? "+" : "") + r.d.toFixed(3)))));
   }
   function sweepBox(idx, qs) {
-    const box = h("div", {}, h("div", { class: "small muted" }, "Trying 11 weights…"));
+    const r = st.rankings[idx];
+    const rrf = r.preset === "rrf";
+    // Each point: where it sits on the axis (0..1), its label, and the
+    // setting it tries.
+    const tries = rrf
+      ? RRF_KS.map((k, i) => ({ x: i / (RRF_KS.length - 1), label: `k ${k}`, over: { k } }))
+      : Array.from({ length: 11 }, (_, i) => ({ x: i / 10, label: i === 0 ? "meaning only" : i === 10 ? "words only" : `${i * 10}%`, over: { alpha: i / 10 } }));
+    const box = h("div", {}, h("div", { class: "small muted" }, `Trying ${tries.length} ${rrf ? "values of k" : "weights"}…`));
     (async () => {
-      const r = st.rankings[idx];
       const pts = [];
-      for (let k = 0; k <= 10; k++) {
-        const alpha = k / 10;
+      for (const t of tries) {
         let sum = 0, n = 0;
-        for (const q of qs) { const res = await query(r, q, alpha); const m = measures(res.rows.map((x) => x.key), gradesFor(q), st.k); if (m.ndcg != null) { sum += m.ndcg; n++; } }
-        pts.push({ alpha, v: n ? sum / n : 0 });
+        for (const q of qs) { const res = await query(r, q, t.over); const m = measures(res.rows.map((x) => x.key), gradesFor(q), st.k); if (m.ndcg != null) { sum += m.ndcg; n++; } }
+        pts.push({ ...t, v: n ? sum / n : 0 });
       }
       const best = pts.reduce((a, b) => (b.v > a.v ? b : a));
-      clear(box, sweepChart(pts, best, r.alpha), h("div", { class: "row", style: { marginTop: "8px" } }, h("span", { class: "small dim" }, `Best: ${fmt.pct(best.alpha, 0)} words, ${fmt.pct(1 - best.alpha, 0)} meaning, nDCG ${best.v.toFixed(3)}.`),
-        h("button", { class: "btn sm primary", onclick: () => { r.alpha = best.alpha; save(); drawCompare(); run(); toast(`${"AB"[idx]} uses ${fmt.pct(best.alpha, 0)} words`, "ok"); } }, "Use it")));
+      const cur = rrf ? (RRF_KS.indexOf(r.k ?? 60) / (RRF_KS.length - 1)) : r.alpha;
+      const said = rrf ? `Best: k ${best.over.k}, nDCG ${best.v.toFixed(3)}.` : `Best: ${fmt.pct(best.over.alpha, 0)} words, ${fmt.pct(1 - best.over.alpha, 0)} meaning, nDCG ${best.v.toFixed(3)}.`;
+      clear(box, sweepChart(pts, best, cur, rrf), h("div", { class: "row", style: { marginTop: "8px" } }, h("span", { class: "small dim" }, said),
+        h("button", { class: "btn sm primary", onclick: () => { Object.assign(r, best.over); save(); drawCompare(); run(); toast(rrf ? `${"AB"[idx]} uses k ${best.over.k}` : `${"AB"[idx]} uses ${fmt.pct(best.over.alpha, 0)} words`, "ok"); } }, "Use it")));
     })().catch((e) => clear(box, h("div", { class: "error" }, e.message)));
     return box;
   }
-  function sweepChart(pts, best, cur) {
+  function sweepChart(pts, best, cur, rrf) {
     const W = 640, H = 210, M = { l: 44, r: 44, t: 26, b: 30 };
     const lo = Math.min(...pts.map((p) => p.v)), hi = Math.max(...pts.map((p) => p.v));
     const y0 = Math.max(0, lo - (hi - lo) * 0.2 - 0.01), y1 = Math.min(1, hi + (hi - lo) * 0.2 + 0.01);
     const X = (a) => M.l + a * (W - M.l - M.r), Y = (v) => H - M.b - (v - y0) / (y1 - y0 || 1) * (H - M.t - M.b);
-    const svgEl = s("svg", { viewBox: `0 0 ${W} ${H}`, class: "rl-sweep", role: "img", "aria-label": "mean nDCG by the share of words" });
+    const svgEl = s("svg", { viewBox: `0 0 ${W} ${H}`, class: "rl-sweep", role: "img", "aria-label": rrf ? "mean nDCG by RRF's k" : "mean nDCG by the share of words" });
     for (let k = 0; k <= 4; k++) { const v = y0 + (y1 - y0) * k / 4; svgEl.append(s("line", { class: "gl", x1: M.l, x2: W - M.r, y1: Y(v), y2: Y(v) }), s("text", { class: "ax", x: M.l - 6, y: Y(v) + 4, "text-anchor": "end" }, v.toFixed(2))); }
-    for (let k = 0; k <= 10; k += 2) svgEl.append(s("text", { class: "ax", x: X(k / 10), y: H - 10, "text-anchor": "middle" }, k === 0 ? "meaning only" : k === 10 ? "words only" : `${k * 10}%`));
+    pts.forEach((p, i) => { if (rrf || i % 2 === 0) svgEl.append(s("text", { class: "ax", x: X(p.x), y: H - 10, "text-anchor": "middle" }, p.label)); });
     svgEl.append(s("line", { class: "cur", x1: X(cur), x2: X(cur), y1: M.t, y2: H - M.b }));
-    svgEl.append(s("path", { class: "ln", d: pts.map((p, i) => `${i ? "L" : "M"}${X(p.alpha)},${Y(p.v)}`).join("") }));
+    svgEl.append(s("path", { class: "ln", d: pts.map((p, i) => `${i ? "L" : "M"}${X(p.x)},${Y(p.v)}`).join("") }));
     for (const p of pts) {
-      const c = s("circle", { class: "pt" + (p === best ? " best" : ""), cx: X(p.alpha), cy: Y(p.v), r: p === best ? 6 : 4 });
-      c.addEventListener("pointermove", (e) => showTip(e.clientX, e.clientY, [h("div", { class: "t" }, `${fmt.pct(p.alpha, 0)} words`), h("div", {}, `nDCG ${p.v.toFixed(3)}`)]));
+      const c = s("circle", { class: "pt" + (p === best ? " best" : ""), cx: X(p.x), cy: Y(p.v), r: p === best ? 6 : 4 });
+      c.addEventListener("pointermove", (e) => showTip(e.clientX, e.clientY, [h("div", { class: "t" }, rrf ? p.label : `${fmt.pct(p.over.alpha, 0)} words`), h("div", {}, `nDCG ${p.v.toFixed(3)}`)]));
       c.addEventListener("pointerleave", hideTip);
       svgEl.append(c);
     }
-    svgEl.append(s("text", { class: "ax best", x: X(best.alpha), y: Y(best.v) - 12, "text-anchor": "middle" }, `best ${best.v.toFixed(3)}`));
+    svgEl.append(s("text", { class: "ax best", x: X(best.x), y: Y(best.v) - 12, "text-anchor": "middle" }, `best ${best.v.toFixed(3)}`));
     return svgEl;
   }
 

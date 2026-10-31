@@ -274,12 +274,15 @@ fn expr(e: &Expr) -> E {
         Expr::Rrf { inputs, k, depth } => E::Rrf(pb::Rrf { inputs: inputs.iter().map(ex).collect(), k: *k, depth: *depth }),
         Expr::Weighted(terms) => E::Weighted(pb::Weighted { terms: terms.iter().map(|(w, e)| pb::WeightedTerm { weight: *w, expr: Some(ex(e)) }).collect() }),
         Expr::Product(xs) => E::Product(exprs(xs)),
-        Expr::Norm { kind, input } => E::Norm(Box::new(pb::Norm {
+        Expr::Norm { kind, input, lo } => E::Norm(Box::new(pb::Norm {
             kind: match kind {
                 NormKind::MinMax => pb::NormKind::MinMax,
                 NormKind::Rank => pb::NormKind::Rank,
+                NormKind::Tmm => pb::NormKind::Tmm,
+                NormKind::ZScore => pb::NormKind::ZScore,
             } as i32,
             input: bex(input),
+            lo: *lo,
         })),
         Expr::Gbdt { model, hash, args, .. } => E::Gbdt(pb::Gbdt { model: model.clone(), hash: hash.clone(), args: args.iter().map(ex).collect() }),
         Expr::CrossEncoder { model, hash, fields, query, .. } => E::CrossEncoder(pb::CrossEncoder { model: model.clone(), hash: hash.clone(), fields: fields.clone(), query: query.clone() }),
@@ -637,8 +640,11 @@ fn from_expr(e: E) -> Result<Expr, ApiError> {
             let kind = match en::<pb::NormKind>(n.kind, "set function")? {
                 pb::NormKind::MinMax => NormKind::MinMax,
                 pb::NormKind::Rank => NormKind::Rank,
+                pb::NormKind::Tmm => NormKind::Tmm,
+                pb::NormKind::ZScore => NormKind::ZScore,
             };
-            Expr::Norm { kind, input: Box::new(from_ex(n.input.map(|x| *x))?) }
+            let lo = n.lo.map(|lo| finite(lo, "lo")).transpose()?;
+            Expr::Norm { kind, input: Box::new(from_ex(n.input.map(|x| *x))?), lo }
         }
         E::Gbdt(g) => Expr::Gbdt { model: g.model, hash: g.hash, args: from_exprs(g.args)?, open: Default::default() },
         E::CrossEncoder(c) => Expr::CrossEncoder { model: c.model, hash: c.hash, fields: c.fields, query: c.query, open: Default::default() },

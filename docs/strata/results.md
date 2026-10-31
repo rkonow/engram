@@ -19,7 +19,7 @@ The design holds up. One file, with ACID commits and a SQL front end, serves ful
 |---|---|---|
 | **One embedded file for three index families** | Every query of the workload, and ten compound statements, run as SQL against one file. Durable commits take 4.1 ms, nearly all of it macOS's `F_FULLFSYNC`; every crash test recovered a committed prefix; snapshots cost at most 0.13 µs; the file is near SQLite's size. | A query reads one table (it joins a table only with itself). Building the HNSW graph makes loads 1.7–5.9× slower than SQLite's (0.2–0.5× without it). |
 | **Faster than the specialised engines** | Warm BM25 is 1.7–3.2× faster than Tantivy and conjunctions 2.7–4.1× faster; Strata wins 24 of 28 warm text and filter comparisons. Vector queries take 0.05–0.10 ms against SQLite's 7.7 ms to 0.7 s scans, and are 28–63× faster cold. | Tantivy counts facets 1.1–2.1× faster on three of the four collections. Cold structured filters are 1.4–3.4× slower than Tantivy's. |
-| **Hybrid ranking as one plan** | RRF and weighted fusion are single SQL expressions under the same filter as their inputs. Weighted fusion adds 0.02–0.04 nDCG@10 over vectors alone on three collections, at 0.2–0.8 ms. | The top-100 shortcut recovers 89–95% of the exact fused top 10. The best weight differs by collection (0.1–0.3), and nothing picks it automatically. |
+| **Hybrid ranking as one plan** | RRF and weighted fusion are single SQL expressions under the same filter as their inputs. Weighted fusion adds 0.02–0.04 nDCG@10 over vectors alone on three collections, at 0.2–0.8 ms. | The top-100 shortcut recovers 89–95% of the exact fused top 10. The best weight differs by collection (0.1–0.3); the relevance lab picks it, the normaliser and RRF's `k` from judged queries ([score fusion](#score-fusion)). |
 | **A planner that adapts per query** | For filtered vector search, 1.8–6.1× faster than the best fixed strategy on the three larger collections, with recall@10 0.991–0.998. For filtered BM25 and filters alone, geometric-mean regret is 1.06–1.18. | It spends 1.0–1.6× an oracle's time. On SciFact, always pre-filtering takes 17% less time. |
 
 ## Setup
@@ -132,6 +132,35 @@ About 50 ms a row on four cores. A server's `--max-rerank` defaults to 20 rows, 
 Weighted fusion beats both of its inputs on three of the four collections. The best BM25 weight is small, 0.1–0.3: the score scales differ, and on these collections the embeddings are the stronger ranking. On TREC-COVID it reaches nDCG@10 0.851, against 0.815 for vectors alone, 0.835 for RRF and 0.658 for BM25; on Quora 0.920 against 0.899 and 0.860. On FiQA, where BM25 is weak, fusion only matches the vector ranking (0.437) and RRF falls below it (0.381), because RRF gives both rankings equal weight. Strata's RRF is within 0.005 of SQLite's RRF over the same two rankings.
 
 The top-100 shortcut is cheap and close to exact. Against weighted ranking computed over every document, it recovers 89–95% of the exact top 10 with nDCG@10 within 0.01–0.03, at 0.2–0.8 ms per query, where the exact computation costs 0.9 ms on SciFact, 12 ms on FiQA and 62 ms on TREC-COVID.
+
+## Score fusion
+
+Which normaliser to put in a weighted sum, and whether a weighted sum beats RRF once each is tuned. The judged queries of each collection alternate between a dev half, on which each family's one parameter is chosen (the BM25 weight from 0.02 to 0.9, or RRF's `k` from 1 to 100), and a test half, which gives the numbers below. Inputs are `bm25(body, ...)` and `similarity(emb, :q)`, 100 candidates each.
+
+| nDCG@10, test half | SciFact (150) | FiQA (324) | TREC-COVID (25) |
+|---|---|---|---|
+| BM25 | 0.697 | 0.259 | 0.718 |
+| vectors | 0.702 | 0.407 | 0.839 |
+| RRF, `k => 60` | 0.722 | 0.362 | **0.883** |
+| RRF, `k` tuned | 0.731 (k 1) | 0.390 (k 1) | 0.883 (k 60) |
+| `minmax`, weight tuned | **0.748** (0.3) | 0.417 (0.02) | 0.877 (0.2) |
+| `tmm`, weight tuned | 0.743 (0.1) | **0.419** (0.02) | 0.877 (0.1) |
+| `zscore`, weight tuned | 0.730 (0.2) | 0.417 (0.02) | 0.867 (0.15) |
+
+Tuned convex fusion beats RRF with its usual `k => 60` on SciFact (+0.021 to +0.026, paired randomisation p 0.01 to 0.04) and FiQA (+0.055 to +0.057, p < 0.001), where BM25 is weak and RRF's equal votes pull the vector ranking down. On TREC-COVID RRF is 0.006 ahead, on 25 test queries (p 0.57 to 0.69). `tmm` and `minmax` are within 0.005 of each other everywhere; `zscore` is no better than either.
+
+What sets `tmm` apart is that its ranking does not depend on how many candidates were read. The share of the top 10 at depth 400 that a shallower depth already returns:
+
+| top-10 overlap with depth 400 | depth | SciFact | FiQA | TREC-COVID |
+|---|---|---|---|---|
+| `tmm` | 100 | 0.999 | 0.996 | 1.000 |
+| `minmax` | 100 | 0.967 | 0.993 | 0.960 |
+| RRF | 100 | 0.991 | 0.993 | 0.944 |
+| `tmm` | 20 | 0.986 | 0.990 | 0.976 |
+| `minmax` | 20 | 0.924 | 0.983 | 0.952 |
+| RRF | 20 | 0.963 | 0.959 | 0.632 |
+
+With `tmm` a row's value moves only when the best candidate changes; with `minmax` every row moves when the weakest one does. The normalisers read the same candidates and do the same work; this run shared its machine with a build, so it gives no latencies. It ran on a 4-core cloud container (Intel Xeon @ 2.10 GHz, 15 GB), Rust 1.97.0: `strata-eval --collections scifact,fiqa,trec-covid --studies fusion --study-queries 1000`, which writes `results/strata/fusion_<collection>.json`.
 
 ## Posting formats and top-k
 

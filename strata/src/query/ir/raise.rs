@@ -3,7 +3,7 @@
 //! made gives back the statement it was made of; a plan from elsewhere is
 //! checked against the schema as the binder checks SQL.
 
-use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, OnConflict, Plan};
+use super::{err, Agg, ArithOp, CmpOp, Expr, Func, Graph, GraphKind, Node, NormKind, OnConflict, Plan};
 use crate::error::Result;
 use crate::query::logical::{self, AggFn, GraphQuery, Having, OrderBy, Pred, Projection, Score, Seeds, Select, Tiebreak, Vectors, CROSS_ENCODER_FIRST};
 use crate::query::rank::Rank;
@@ -628,7 +628,21 @@ impl<'a> Raise<'a> {
                 func.arity(args.len()).map_err(|n| err(format!("{}() takes {n}", func.name())))?;
                 Score::Call { func: *func, args: args.iter().map(|a| self.rank(a, true)).collect::<Result<_>>()? }
             }
-            Expr::Norm { kind, input } => Score::Norm { kind: *kind, input: sub(self, input)? },
+            Expr::Norm { kind, input, lo } => {
+                let input = sub(self, input)?;
+                // tmm reads the least value of its input, the input's own
+                // unless the plan gives one.
+                let lo = match (kind, lo) {
+                    (NormKind::Tmm, Some(lo)) if lo.is_finite() => Some(*lo),
+                    (NormKind::Tmm, None) => match input.least(self.schema) {
+                        Some(lo) => Some(lo),
+                        None => return Err(err("tmm of a ranking with no least value of its own needs lo")),
+                    },
+                    (NormKind::Tmm, Some(lo)) => return Err(err(format!("tmm's lo is a finite number, not {lo}"))),
+                    _ => None,
+                };
+                Score::Norm { kind: *kind, input, lo }
+            }
             Expr::Gbdt { model, hash, args, open } => {
                 let Some(m) = &open.0 else {
                     return Err(err(format!("ranking model {model} is not open: a database or coordinator opens a plan's models before it runs it (Db::run)")));

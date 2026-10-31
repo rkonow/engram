@@ -26,12 +26,12 @@ ORDER BY bm25(body, 'mrna vaccine efficacy') DESC LIMIT 10;
 SELECT id FROM papers WHERE rating >= 4
 ORDER BY similarity(emb, :q) DESC LIMIT 10;
 
--- hybrid: reciprocal rank fusion, or a weighted sum of normalised scores
+-- hybrid: a weighted sum of normalised scores, or reciprocal rank fusion
 SELECT id FROM papers WHERE year >= 2015
-ORDER BY rrf(bm25(body, :text), similarity(emb, :q)) DESC LIMIT 10;
+ORDER BY 0.2 * tmm(bm25(body, :text)) + 0.8 * tmm(similarity(emb, :q)) DESC LIMIT 10;
 
 SELECT id FROM papers WHERE year >= 2015
-ORDER BY 0.2 * minmax(bm25(body, :text)) + 0.8 * minmax(similarity(emb, :q)) DESC LIMIT 10;
+ORDER BY rrf(bm25(body, :text), similarity(emb, :q)) DESC LIMIT 10;
 
 -- any expression of scores and columns
 SELECT id FROM papers
@@ -337,17 +337,23 @@ SELECT id FROM items WHERE in_stock ORDER BY rrf(bm25(title, :q), ranked(:keys))
 
 A listed row scores `-(its position)`, from `-1` for the first key; a key listed twice ranks where it is first. A row the list leaves out has `NULL`, so in an expression it ranks last unless `coalesce` gives it a value, and in a weighted sum it takes the input's worst value, as a missing column does. Times another score (`ranked(:keys) * rating`) it multiplies as arithmetic, not as a product of scores, which would count its negative values as 0. A key no live row has is skipped. On its own, `ORDER BY ranked(:keys) DESC` answers the listed rows that `WHERE` keeps, in list order. The keys are a parameter holding a list (an array of keys in the HTTP API), a tuple (`ranked(('a', 'b'))`) or an array (`ranked(ARRAY['a', 'b'])`). Over shards, each shard scores its own rows from the list and the coordinator merges them, so no extra round is needed. A plan that uses it needs the plan feature `ranked`.
 
-### Weighted sums: `minmax()`
+### Weighted sums: `tmm()`, `minmax()` and `zscore()`
 
-A weighted sum of min-max normalised scores is weighted fusion: `0.2 * minmax(bm25(body, :t)) + 0.8 * minmax(similarity(emb, :q))`. Weights are numeric constants; `+` and `-` combine any number of terms. Candidates are the union of each input's top 100, re-scored exactly by every input and min-max normalised over that union:
+A weighted sum of normalised scores is weighted (convex) fusion: `0.2 * tmm(bm25(body, :t)) + 0.8 * tmm(similarity(emb, :q))`. Weights are numeric constants; `+` and `-` combine any number of terms. Candidates are the union of each input's top 100, re-scored exactly by every input and normalised over that union ($C$). Three normalisers put a score on one scale:
 
-$$
-\mathrm{fused}(d) = \sum_i w_i\,\frac{s_i(d) - \min_{C} s_i}{\max_{C} s_i - \min_{C} s_i}
-$$
+| normaliser | a row's value | a row without a value |
+|---|---|---|
+| `tmm(x)`, theoretical min-max | $\dfrac{x - lo}{\max_C x - lo}$, `lo` the least value `x` can take | 0 |
+| `minmax(x)` | $\dfrac{x - \min_C x}{\max_C x - \min_C x}$, 1 where all are equal | 0 |
+| `zscore(x)` | $\dfrac{x - \mathrm{mean}_C x}{\mathrm{sd}_C x}$, 0 where all are equal | the least of the candidates' |
+
+Use `tmm` unless your own judged queries say otherwise. Its lower end is fixed by what the score is, not by the candidates: a row's value depends only on the best candidate, which is the same at any depth, while `minmax` moves every row whenever the weakest candidate changes, which it does with `depth` and with what each input happens to return. Bruch, Gai and Ingber ([TOIS 2023](https://arxiv.org/abs/2210.11934)) find this convex combination beats RRF in and out of domain once its one weight is tuned, and that a few dozen judged queries tune it; the [relevance lab](server.md) tunes it on yours ([what it gives on BEIR](results.md#score-fusion)).
+
+`lo` is the score's own: 0 for `bm25`, a `SPARSE` similarity (weights at least 0, as learned models give them), `rrf`, `ppr` and `decay`; -1 for `similarity` and a one-vector `maxsim`, the least cosine of unit vectors (the vectors of an embedded field, and of most models; for vectors of other lengths, give `lo`); -n for `maxsim` of n vectors on a multi-vector field. Anything else, a column or an expression, needs it written: `tmm(rating, lo => 0)`. With `hi` too, `tmm(x, lo => a, hi => b)` is $(x - a) / (b - a)$, each row's own value (0 without one), fixed bounds that read nothing of the other candidates.
 
 Options, given on any input: `depth => 100` (candidates per input), `exact => 1` (score every row that passes `WHERE` instead of the top-100 union). The top-100 shortcut recovers 89–95% of the exact fused top 10 ([results](results.md#hybrid-ranking)).
 
-A row without a value of a column input (`0.7 * minmax(bm25(body, :t)) + 0.3 * minmax(rating)` for a row whose `rating` is `NULL`) takes that input's worst value among the candidates: its lowest when the weight is positive and its highest when the weight is negative (0 and 1 after min-max), so a missing value never lifts a row.
+A row without a value of a column input (`0.7 * minmax(bm25(body, :t)) + 0.3 * minmax(rating)` for a row whose `rating` is `NULL`) takes that input's worst value among the candidates: its lowest when the weight is positive and its highest when the weight is negative (0 and 1 after min-max), so a missing value never lifts a row. Under `tmm` and `zscore` it takes the value in the table above. A plan with `tmm` or `zscore` needs the plan feature `score_norms`, which a version of Strata from before them refuses by name.
 
 **Changed:** a sum of bare scores, `0.2 * bm25(body, :t) + 0.8 * similarity(emb, :q)`, was this fusion before ranking expressions; `+` now adds raw values, as in any expression below. Write `minmax()` around each term for the fusion. For one release, `EXPLAIN` and a query's plan lines add a note when an expression adds raw relevance scores. `norm => 'none'`, which kept raw scores in a sum, is accepted and changes nothing.
 
@@ -373,18 +379,20 @@ SELECT id FROM papers ORDER BY -rank(bm25(body, :t)) - rank(similarity(emb, :q))
 | `bm25`, `similarity`, `ppr`, `decay`, `rrf`, `ranked`, a numeric column, `hops()`, `seq_no()` | the leaves: a row's value of each |
 | `ln(x)`, `log(x)` (base 10), `log(b, x)`, `exp(x)`, `sqrt(x)`, `pow(x, y)`, `abs(x)`, `round(x[, digits])`, `sigmoid(x)`, `clamp(x, lo, hi)` | numeric functions |
 | `least(…)`, `greatest(…)`, `coalesce(…)` | over their arguments that are not `NULL` |
+| `tmm(x[, lo => a][, hi => b])` | `x` from its least possible value to the best row's, put on [0, 1]: 0 where `x` is `NULL` ([above](#weighted-sums-tmm-minmax-and-zscore)) |
 | `minmax(x)` | `x` over the rows ranked, put on [0, 1]: 1 where all are equal, 0 where `x` is `NULL` |
+| `zscore(x)` | `x` less the rows' mean, over their deviation; `NULL` takes the least of the rows' |
 | `rank(x)` | 1 plus the number of rows ranked with a greater `x`; `NULL` places after every other |
 | `CASE WHEN c THEN x … ELSE y END` | the first branch whose condition holds (any `WHERE` condition), else `y`, else `NULL` |
 | `count_true(c, …)` | how many of the conditions hold ([`AT_LEAST`](#some-of-the-conditions-at_least)) |
 
 `NULL` is a missing value (a `NULL` column, a row without a vector, one a traversal does not reach) or a result that is not a finite number (`ln(0)`, a division by 0, an overflow). Arithmetic and functions of `NULL` are `NULL`, except `coalesce`, `least` and `greatest`, which skip it. A row whose score is `NULL` ranks after every other, and its `score()` is `NULL`.
 
-Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's, `ranked`), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `minmax()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
+Candidates are the top `depth` (100) rows of each relevance leaf (`bm25`, `similarity`, a graph's, `ranked`), and of every input of `rrf`; an expression with no such leaf (`rating * 2 + year / 1000`), or `exact => 1` on any leaf, ranks every row that passes `WHERE`. A [rank-safe boost](#rank-safe-boosts) ranks every row its text score matches. Each leaf scores every candidate exactly, and `tmm()`, `minmax()`, `zscore()` and `rank()` are taken over the candidates. Over shards, each shard returns its candidates' leaf values and the coordinator runs the expression, so a split collection ranks like the whole one.
 
 #### Rank-safe boosts
 
-An expression with one text score (`bm25`, or `similarity` on a `SPARSE` field) whose other parts are numeric columns, `decay`, `CASE` conditions, numbers and `seq_no()` finds its exact top rows: the rows that scoring every row the text matches would rank first, not only the best of the text's top 100. `minmax()`, `rank()`, `rrf` and `exact => 1` take the candidates above instead.
+An expression with one text score (`bm25`, or `similarity` on a `SPARSE` field) whose other parts are numeric columns, `decay`, `CASE` conditions, numbers and `seq_no()` finds its exact top rows: the rows that scoring every row the text matches would rank first, not only the best of the text's top 100. Set functions (`tmm()`, `minmax()`, `zscore()`, `rank()`), `rrf` and `exact => 1` take the candidates above instead.
 
 ```sql
 -- the 10 best by BM25 boosted by importance, even a row 5,000th by BM25 alone
@@ -413,7 +421,7 @@ SELECT id, score() FROM b ORDER BY minmax(bm25(body, :t)) + minmax(similarity(em
 
 The planner makes one search of them, with phases. Each phase ranks the rows of the one before by an expression, best first, and may read any of the table's columns, since the rows are the table's. Every row a phase reads goes on: one the expression gives no value ranks last with a `NULL` score (and a row a `bm25` phase's terms miss scores 0), and rows tied keep the order the phase before gave them. `LIMIT` and `OFFSET` on the query cut the last phase, and `score()` is the last phase's score. The first `WITH` may filter (`WHERE`) and rank as any query does; each later step reads the step before alone, with no `WHERE` or grouping, ranks by one expression `DESC` (which may hold [correlated subqueries](#correlated-subqueries-a-ranking-that-reads-other-rows)), and each `WITH` keeps the table's columns (`*`) and has a `LIMIT`. `WITH` results before the first phase, a user's history say, are computed first, for the phases' subqueries to read. Other `WITH` queries plan as before: the table restricted to the rows of the `WITH`.
 
-A phase whose expression is row-local is a second phase: over shards, each shard scores it on its own top rows by the first phase. A phase with `minmax()`, `rank()`, `rrf` or a weighted sum reads every row it reranks, so it is a global phase: it runs once over the merged rows (on the coordinator over shards), and so does every phase after it. The coordinator keeps the top rows of the whole collection by the first phase before it ranks them by the next, so a split collection answers exactly as the whole one does. `EXPLAIN` shows each phase and which kind it is, and a query's plan lines say how many rows each reranked. The first phase's `LIMIT` counts against the rows a query may reach (`max_rows`), and the phases against its deadline.
+A phase whose expression is row-local is a second phase: over shards, each shard scores it on its own top rows by the first phase. A phase with a set function (`tmm()`, `minmax()`, `zscore()`, `rank()`), `rrf` or a weighted sum reads every row it reranks, so it is a global phase: it runs once over the merged rows (on the coordinator over shards), and so does every phase after it. The coordinator keeps the top rows of the whole collection by the first phase before it ranks them by the next, so a split collection answers exactly as the whole one does. `EXPLAIN` shows each phase and which kind it is, and a query's plan lines say how many rows each reranked. The first phase's `LIMIT` counts against the rows a query may reach (`max_rows`), and the phases against its deadline.
 
 From Python, `rerank(expr, count)` adds a phase: `t.select("id", score()).order_by(bm25("body", q)).rerank(col("rating"), 100).limit(10)`. A plan with phases needs the plan feature `rank_phases`.
 
@@ -475,7 +483,7 @@ SELECT id, bm25(title, :t) AS title_bm25, ln(1 + rating) AS r, year / 1000 FROM 
 ORDER BY similarity(emb, :q) DESC LIMIT 10;
 ```
 
-- **`features()`** stands for one column per input, each once, named by its SQL text: every leaf of the ranking (a score such as `bm25(body, :t)` or `similarity(emb, :q)`, a column, `decay(..)`, `hops()`), the first phase's first, then each phase's expression that scores a row by itself and is not a leaf. With [rerank phases](#rerank-phases) it lists every phase's. An expression with `minmax()`, `rank()`, `rrf` or a weighted sum ranks rows against each other, so it is not a column: its inputs are, and `score()` is its value. A ranking by `distance(..)` lists the `similarity(..)` it ranks by. `features()` takes no alias and needs an `ORDER BY`.
+- **`features()`** stands for one column per input, each once, named by its SQL text: every leaf of the ranking (a score such as `bm25(body, :t)` or `similarity(emb, :q)`, a column, `decay(..)`, `hops()`), the first phase's first, then each phase's expression that scores a row by itself and is not a leaf. With [rerank phases](#rerank-phases) it lists every phase's. An expression with a set function (`tmm()`, `minmax()`, `zscore()`, `rank()`), `rrf` or a weighted sum ranks rows against each other, so it is not a column: its inputs are, and `score()` is its value. A ranking by `distance(..)` lists the `similarity(..)` it ranks by. `features()` takes no alias and needs an `ORDER BY`.
 - **A selected expression** may use anything a ranking expression does but the set functions: `bm25`, `similarity`, `decay`, columns, numbers, arithmetic, `ln` and the other functions, `CASE`. Its value is the ranking's, bit for bit: a row a `bm25`'s terms miss scores 0, and one without a value is `NULL`. `ORDER BY 2` ranks by the second column when it is one.
 - **Over shards** a feature is one database's value: a coordinator sums the shards' BM25 statistics of the terms any column scores, and its fetch round computes the columns for the page alone, with those statistics.
 - A plan with such a column needs the plan feature `rank_features`. From Python, `features()` goes in `select`, and so does any expression of scores (`select("id", bm25("title", q).alias("t"))`); Python names a feature as it writes the expression.

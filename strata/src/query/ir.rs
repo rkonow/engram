@@ -64,8 +64,10 @@ mod raise;
 pub const VERSION: u32 = 1;
 
 /// The plan features this version of Strata reads.
-pub const FEATURES: [&str; 21] =
-    [OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE];
+pub const FEATURES: [&str; 22] = [
+    OPERATORS, SEQ_NO, RANK_EXPRESSIONS, SEMANTIC_ID, RANK_PHASES, RANK_FEATURES, MAXSIM, RANK_PROFILES, RANK_MODELS, DISTINCT_ON, EDGE_TABLE, RANKED, TEXT_OPERATORS, PREFIX, CORRELATED, PREFIX_EDITS, MIN_MATCH, AT_LEAST, GUARD, PER_CAP, ENCODE,
+    SCORE_NORMS,
+];
 
 /// The feature of a plan with operators over rows in memory: a join,
 /// `WITH`, a subquery, `DISTINCT`, or a node over another's rows than a
@@ -82,6 +84,11 @@ pub const SEQ_NO: &str = "seq_no";
 /// or one of the fused shapes ([`Expr::Rrf`], [`Expr::Weighted`],
 /// [`Expr::Product`]).
 pub const RANK_EXPRESSIONS: &str = "rank_expressions";
+
+/// The feature of a plan with a set function that came after `minmax` and
+/// `rank`: `tmm(x)` or `zscore(x)` ([`NormKind::Tmm`], [`NormKind::ZScore`]),
+/// which a Strata from before them would read as `minmax(x)`.
+pub const SCORE_NORMS: &str = "score_norms";
 
 /// The feature of a plan that scores with several query vectors
 /// ([`Expr::MaxSim`]), takes a dot product of vectors ([`Func::Dot`]), or
@@ -624,6 +631,29 @@ pub enum NormKind {
     /// `rank(x)`: 1 for the largest `x`, plus the number of candidates with
     /// a larger value; rows where `x` is NULL rank after every other.
     Rank,
+    /// `tmm(x)`, theoretical min-max (Bruch, Gai and Ingber, TOIS 2023):
+    /// `(x - lo) / (max - lo)`, where `lo` is the least value `x` can take
+    /// ([`Expr::Norm`]'s `lo`) and `max` the largest over the candidates;
+    /// 0 where `x` is NULL, and 0 for every row where no candidate is above
+    /// `lo`. Unlike `minmax`, a row's value does not depend on how deep the
+    /// candidates go: the largest is the best row, at any depth.
+    Tmm,
+    /// `zscore(x)`: `(x - mean) / sd` over the candidates (the population
+    /// deviation), 0 where they all have one value; a row where `x` is NULL
+    /// takes the least value of the candidates.
+    ZScore,
+}
+
+impl NormKind {
+    /// The set function's name in SQL.
+    pub fn name(self) -> &'static str {
+        match self {
+            NormKind::MinMax => "minmax",
+            NormKind::Rank => "rank",
+            NormKind::Tmm => "tmm",
+            NormKind::ZScore => "zscore",
+        }
+    }
 }
 
 /// A branch of [`Expr::Case`].
@@ -772,8 +802,16 @@ pub enum Expr {
     /// The product of scores.
     Product(Vec<Expr>),
     /// A set function of a ranking expression, over the rows it ranks
-    /// (feature [`RANK_EXPRESSIONS`]).
-    Norm { kind: NormKind, input: Box<Expr> },
+    /// (feature [`RANK_EXPRESSIONS`]; [`SCORE_NORMS`] for `tmm` and
+    /// `zscore`). `lo` is the least value `input` can take, which `tmm`
+    /// reads: absent in a plan written by hand, where the reader takes the
+    /// input's own (0 for `bm25`, -1 for `similarity`, ...).
+    Norm {
+        kind: NormKind,
+        input: Box<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lo: Option<f64>,
+    },
     /// A ranking model's score of a row from its features `args`, ranking
     /// expressions of the row ([`crate::query::model`], feature
     /// [`RANK_MODELS`]). `model` names it in the models directory, and
@@ -1716,6 +1754,11 @@ impl Plan {
         root.visit_exprs(&mut |e| ranked |= matches!(e, Expr::Ranked { .. }));
         if ranked {
             features.push(RANKED.to_string());
+        }
+        let mut norms = false;
+        root.visit_exprs(&mut |e| norms |= matches!(e, Expr::Norm { kind: NormKind::Tmm | NormKind::ZScore, .. }));
+        if norms {
+            features.push(SCORE_NORMS.to_string());
         }
         if root.has_text_operators() {
             features.push(TEXT_OPERATORS.to_string());

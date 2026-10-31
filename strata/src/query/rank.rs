@@ -76,8 +76,9 @@ pub enum Expr {
     Arith { op: ArithOp, left: Box<Expr>, right: Box<Expr> },
     Neg(Box<Expr>),
     Call { func: Func, args: Vec<Expr> },
-    /// A set function over the candidates ([`NormKind`]).
-    Norm { kind: NormKind, input: Box<Expr> },
+    /// A set function over the candidates ([`NormKind`]); `lo` is the
+    /// least value of `input`, which `tmm` reads.
+    Norm { kind: NormKind, input: Box<Expr>, lo: f64 },
     /// The value of the first branch whose test is a number other than 0,
     /// else `otherwise`, else NULL.
     Case { whens: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
@@ -142,7 +143,7 @@ impl<'s> Compile<'s> {
             Score::Arith { op, left, right } => Expr::Arith { op: *op, left: Box::new(self.expr(left)), right: Box::new(self.expr(right)) },
             Score::Neg(x) => Expr::Neg(Box::new(self.expr(x))),
             Score::Call { func, args } => Expr::Call { func: *func, args: args.iter().map(|a| self.expr(a)).collect() },
-            Score::Norm { kind, input } => Expr::Norm { kind: *kind, input: Box::new(self.expr(input)) },
+            Score::Norm { kind, input, lo } => Expr::Norm { kind: *kind, input: Box::new(self.expr(input)), lo: lo.unwrap_or(0.0) },
             Score::Gbdt { model, args, open, .. } => Expr::Gbdt { name: model.clone(), model: open.0.clone(), args: args.iter().map(|a| self.expr(a)).collect() },
             Score::Case { whens, otherwise } => Expr::Case {
                 whens: whens.iter().map(|(c, x)| (self.expr(c), self.expr(x))).collect(),
@@ -347,7 +348,29 @@ impl<'s> Rank<'s> {
                         .collect(),
                 )
             }
-            Expr::Norm { kind: NormKind::MinMax, input } => {
+            Expr::Norm { kind: NormKind::Tmm, input, lo } => {
+                let x = self.values(input, n, values, lists);
+                let lo = *lo;
+                let hi = x.iter().filter(|v| !v.is_nan()).fold(f64::NEG_INFINITY, |hi, &v| hi.max(v));
+                Cow::Owned(each(x, &|v| match v {
+                    v if v.is_nan() => 0.0,
+                    _ if hi > lo => (v - lo) / (hi - lo),
+                    _ => 0.0,
+                }))
+            }
+            Expr::Norm { kind: NormKind::ZScore, input, .. } => {
+                let x = self.values(input, n, values, lists);
+                let (count, sum) = x.iter().filter(|v| !v.is_nan()).fold((0usize, 0.0), |(c, s), &v| (c + 1, s + v));
+                let mean = sum / count.max(1) as f64;
+                let var = x.iter().filter(|v| !v.is_nan()).map(|&v| (v - mean) * (v - mean)).sum::<f64>() / count.max(1) as f64;
+                let sd = var.sqrt();
+                let z = |v: f64| if sd > 0.0 { (v - mean) / sd } else { 0.0 };
+                // A missing value is the least of the candidates'.
+                let least = x.iter().filter(|v| !v.is_nan()).map(|&v| z(v)).fold(f64::INFINITY, f64::min);
+                let least = if least.is_finite() { least } else { 0.0 };
+                Cow::Owned(each(x, &|v| if v.is_nan() { least } else { z(v) }))
+            }
+            Expr::Norm { kind: NormKind::MinMax, input, .. } => {
                 let x = self.values(input, n, values, lists);
                 let (lo, hi) = x.iter().filter(|v| !v.is_nan()).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
                 Cow::Owned(each(x, &|v| match v {
@@ -356,7 +379,7 @@ impl<'s> Rank<'s> {
                     _ => 1.0,
                 }))
             }
-            Expr::Norm { kind: NormKind::Rank, input } => {
+            Expr::Norm { kind: NormKind::Rank, input, .. } => {
                 let x = self.values(input, n, values, lists);
                 // Best first, NULL last: a row's rank is 1 plus the rows
                 // before its run of equal values.
@@ -495,7 +518,8 @@ impl<'s> Rank<'s> {
             Expr::Neg(x) => format!("-{}", operand(x, 3)),
             Expr::Call { func, args } => format!("{}({})", func.name(), args.iter().map(|a| self.show(a, schema)).collect::<Vec<_>>().join(", ")),
             Expr::Gbdt { name, args, .. } => format!("gbdt({})", std::iter::once(format!("'{name}'")).chain(args.iter().map(|a| self.show(a, schema))).collect::<Vec<_>>().join(", ")),
-            Expr::Norm { kind, input } => format!("{}({})", if *kind == NormKind::MinMax { "minmax" } else { "rank" }, self.show(input, schema)),
+            Expr::Norm { kind: NormKind::Tmm, input, lo } => format!("tmm({}, lo => {lo})", self.show(input, schema)),
+            Expr::Norm { kind, input, .. } => format!("{}({})", kind.name(), self.show(input, schema)),
             Expr::Case { whens, otherwise } => {
                 let mut s = "CASE".to_string();
                 for (c, x) in whens {
@@ -980,7 +1004,26 @@ mod tests {
                     Func::Lower | Func::Upper | Func::Length | Func::Dot | Func::SidAt => None,
                 }
             }
-            Score::Norm { kind: NormKind::MinMax, input } => {
+            Score::Norm { kind: NormKind::Tmm, input, lo } => {
+                let xs = all(input);
+                let lo = lo.unwrap();
+                let hi = xs.iter().flatten().fold(f64::NEG_INFINITY, |hi, &v| hi.max(v));
+                Some(match xs[i] {
+                    Some(v) if hi > lo => (v - lo) / (hi - lo),
+                    _ => 0.0,
+                })
+            }
+            Score::Norm { kind: NormKind::ZScore, input, .. } => {
+                let xs: Vec<f64> = all(input).into_iter().flatten().collect();
+                let mean = xs.iter().sum::<f64>() / xs.len().max(1) as f64;
+                let sd = (xs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / xs.len().max(1) as f64).sqrt();
+                let z = |v: f64| if sd > 0.0 { (v - mean) / sd } else { 0.0 };
+                Some(match all(input)[i] {
+                    Some(v) => z(v),
+                    None => xs.iter().map(|&v| z(v)).reduce(f64::min).unwrap_or(0.0),
+                })
+            }
+            Score::Norm { kind: NormKind::MinMax, input, .. } => {
                 let xs = all(input);
                 let (lo, hi) = xs.iter().flatten().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
                 Some(match xs[i] {
@@ -989,7 +1032,7 @@ mod tests {
                     Some(_) => 1.0,
                 })
             }
-            Score::Norm { kind: NormKind::Rank, input } => {
+            Score::Norm { kind: NormKind::Rank, input, .. } => {
                 let xs = all(input);
                 Some(1.0 + xs.iter().filter(|x| match (x, xs[i]) {
                     (Some(x), Some(v)) => *x > v,
@@ -1043,7 +1086,10 @@ mod tests {
                 };
                 Score::Call { func, args: [a, b, c].iter().take(n).map(|&s| sub(s)).collect() }
             }
-            5 => Score::Norm { kind: [NormKind::MinMax, NormKind::Rank][next(2) as usize], input: bx(sub(a)) },
+            5 => match [NormKind::MinMax, NormKind::Rank, NormKind::Tmm, NormKind::ZScore][next(4) as usize] {
+                NormKind::Tmm => Score::Norm { kind: NormKind::Tmm, input: bx(sub(a)), lo: Some([0.0, -1.0, 2.5][next(3) as usize]) },
+                kind => Score::Norm { kind, input: bx(sub(a)), lo: None },
+            },
             6 => Score::Case { whens: vec![(sub(a), sub(b))], otherwise: (next(2) == 0).then(|| bx(sub(c))) },
             _ => Score::Arith { op: ArithOp::Add, left: bx(sub(a)), right: bx(sub(b)) },
         }

@@ -1534,8 +1534,10 @@ impl<'a> Binder<'a> {
                         _ => Err(err("ranked(keys) takes one argument: a list of primary keys, best first")),
                     },
                     "features" => Err(err("features() stands for several columns: it takes no alias and is not part of an expression")),
-                    "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)? }),
-                    "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)? }),
+                    "minmax" => Ok(Score::Norm { kind: NormKind::MinMax, input: bx(one("x")?)?, lo: None }),
+                    "rank" => Ok(Score::Norm { kind: NormKind::Rank, input: bx(one("x")?)?, lo: None }),
+                    "zscore" => Ok(Score::Norm { kind: NormKind::ZScore, input: bx(one("x")?)?, lo: None }),
+                    "tmm" => self.tmm(*one("x")?, &opts),
                     "gbdt" => {
                         let usage = "gbdt('model', feature, ...) takes a model's name and the features it reads, in order";
                         let [model, features @ ..] = args.as_slice() else { return Err(err(usage)) };
@@ -1588,6 +1590,42 @@ impl<'a> Binder<'a> {
 
     /// `similarity(field, vector)`, or `distance(field, vector)` (which
     /// ranks the same, ascending, on its own in ORDER BY).
+    /// `tmm(x [, lo => a] [, hi => b])`: theoretical min-max. `lo` is the
+    /// least value `x` can take, `x`'s own by default ([`Score::least`]);
+    /// with `hi` too the bounds are fixed, and it is the row's own value
+    /// `(x - a) / (b - a)`, 0 where `x` is NULL.
+    fn tmm(&self, x: &Expr, opts: &Opts) -> Result<Score> {
+        let input = self.rank(x)?;
+        let bound = |k: &str| -> Result<Option<f64>> {
+            match opts.get(k) {
+                None => Ok(None),
+                Some(v) => match v.as_f64() {
+                    Some(b) if b.is_finite() => Ok(Some(b)),
+                    _ => Err(err(format!("tmm's {k} is a number, not {v:?}"))),
+                },
+            }
+        };
+        if let Some(k) = opts.keys().find(|k| *k != "lo" && *k != "hi") {
+            return Err(err(format!("tmm(x, lo => a, hi => b) takes the options lo and hi, not {k}")));
+        }
+        let lo = match bound("lo")?.or_else(|| input.least(self.schema)) {
+            Some(lo) => lo,
+            None => return Err(err(format!("tmm({x}) needs the least value {x} can take: tmm({x}, lo => n)"))),
+        };
+        match bound("hi")? {
+            None => Ok(Score::Norm { kind: NormKind::Tmm, input: Box::new(input), lo: Some(lo) }),
+            Some(hi) if hi > lo => {
+                let scaled = Score::Arith {
+                    op: ArithOp::Div,
+                    left: Box::new(Score::Arith { op: ArithOp::Sub, left: Box::new(input), right: Box::new(Score::Num(lo)) }),
+                    right: Box::new(Score::Num(hi - lo)),
+                };
+                Ok(Score::Call { func: Func::Coalesce, args: vec![scaled, Score::Num(0.0)] })
+            }
+            Some(hi) => Err(err(format!("tmm's hi ({hi}) must be above its lo ({lo})"))),
+        }
+    }
+
     fn similarity(&self, args: &[&Expr], opts: Opts, distance: bool) -> Result<Score> {
         let [field, v] = args else { return Err(err("similarity(field, vector)")) };
         let field = self.typed_field(field, |t| matches!(t, FieldType::Vector { .. } | FieldType::Sparse), "VECTOR or SPARSE")?;

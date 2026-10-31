@@ -48,7 +48,7 @@ const STAGES = [
 ];
 const MEASURES = [["count", "COUNT(*)"], ["distinct", "COUNT(DISTINCT …)"], ["sum", "SUM"], ["avg", "AVG"], ["min", "MIN"], ["max", "MAX"]];
 
-const blank = (table) => ({ table, signals: [], fusion: "rrf", filters: [], any: false, boosts: [], group: null, sort: null, columns: [], score: true, limit: 20 });
+const blank = (table) => ({ table, signals: [], fusion: "weighted", filters: [], any: false, boosts: [], group: null, sort: null, columns: [], score: true, limit: 20 });
 
 // ------------------------------------------------------------ SQL
 const num = (v) => { const x = Number(v); if (v === "" || v == null || !Number.isFinite(x)) throw new Error(`“${v ?? ""}” is not a number`); return String(x); };
@@ -114,7 +114,7 @@ export function toSql(st) {
     if (scores.length === 1) rank = scores[0].sql;
     else if (scores.length > 1 && st.fusion === "weighted") {
       const total = scores.reduce((a, x) => a + (x.s.w ?? 1), 0) || 1;
-      rank = scores.map((x) => `${round((x.s.w ?? 1) / total)} * minmax(${x.sql})`).join(" + ");
+      rank = scores.map((x) => `${round((x.s.w ?? 1) / total)} * tmm(${x.sql})`).join(" + ");
     } else if (scores.length > 1) rank = `rrf(${scores.map((x) => x.sql).join(", ")})`;
     const factors = [];
     for (const b of st.boosts) {
@@ -412,7 +412,7 @@ function render(page, r) {
             st.signals.length > 1 && st.fusion === "weighted" ? weight(s) : null));
       });
       if (st.signals.length > 1) items.push(h("div", { class: "row fuse" }, icon("route"), h("span", { class: "small dim" }, "Fuse the rankings by"),
-        seg([["rrf", "rank (RRF)", "Reciprocal rank fusion: a row near the top of several lists wins; no tuning"], ["weighted", "weighted scores", "A weighted sum of min-max normalised scores"]], st.fusion, (v) => { st.fusion = v; changed(); })));
+        seg([["weighted", "weighted scores", "A weighted sum of the scores, each divided by its best row's from the least it can be (tmm): better than RRF once the weights are tuned on a few graded queries (the Relevance lab tunes them)"], ["rrf", "rank (RRF)", "Reciprocal rank fusion: a row near the top of several lists wins; no weights to tune"]], st.fusion, (v) => { st.fusion = v; changed(); })));
       return items;
     }
     if (id === "filter") return st.filters.map((c) => filterItem(c));

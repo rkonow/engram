@@ -6,7 +6,7 @@ import datetime
 import pytest
 
 import strata
-from strata import at_least, bm25, case, clamp, coalesce, col, count, count_true, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt
+from strata import at_least, bm25, case, clamp, coalesce, col, count, count_true, exp, features, greatest, least, lit, ln, log, match, maxsim, minmax, rank, ranked, rrf, score, similarity, sigmoid, sqrt, tmm, zscore
 from conftest import BOOKS, book
 
 
@@ -157,10 +157,24 @@ def test_ranking_expressions_run_as_their_sql(db):
          "round(abs(rating - 3), 1) + sqrt(year / 1000) + pow(clamp(rating, 1, 4), 2)"),
         (greatest(sigmoid(col("rating")), least(log(col("year")), exp(1))) % 2,
          "greatest(sigmoid(rating), least(log(year), exp(1))) % 2"),
+        (0.6 * tmm(bm25("title", "river")) + 0.4 * tmm(bm25("description", "river")),
+         "0.6 * tmm(bm25(title, 'river')) + 0.4 * tmm(bm25(description, 'river'))"),
+        (tmm(bm25("description", "dragon")) - 0.1 * tmm(col("rating"), lo=0),
+         "tmm(bm25(description, 'dragon')) - 0.1 * tmm(rating, lo => 0)"),
+        (tmm(bm25("description", "dragon"), lo=0, hi=10) + tmm(col("rating"), lo=0, hi=5),
+         "tmm(bm25(description, 'dragon'), lo => 0, hi => 10) + tmm(rating, lo => 0, hi => 5)"),
+        (zscore(bm25("title", "river")) + 0.5 * zscore(col("year")),
+         "zscore(bm25(title, 'river')) + 0.5 * zscore(year)"),
     ]:
         same(db, t.select("id", score()).order_by(q).limit(8), f"SELECT id, score() FROM books ORDER BY {sql} DESC LIMIT 8")
     with pytest.raises(TypeError):
         col("rating") + "x"
+    with pytest.raises(strata.StrataError):
+        tmm(col("rating"), hi=5)
+    with pytest.raises(strata.StrataError):
+        tmm(col("rating"), lo=5, hi=5)
+    with pytest.raises(strata.StrataError, match="lo"):
+        db.run(t.select("id").order_by(tmm(col("rating"))).limit(3))
 
 
 def test_rerank_phases_run_as_their_sql(db):

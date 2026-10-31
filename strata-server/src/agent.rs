@@ -126,8 +126,8 @@ SELECT <fields | * | score() | aggregates> FROM {table} [WHERE <predicate>] [GRO
 - bm25(text_field, 'words') ranks by text relevance (a row scores if it has any of the words). Put the user's key words here.
 - Comparisons (=, <, <=, >, >=, !=), BETWEEN, IN (...), AND, OR, NOT on KEYWORD, INT and FLOAT fields.
 {vector_help}{sparse_help}{graph_help}
-- rrf(score1, score2) fuses two rankings by rank; 0.7 * minmax(bm25(...)) + 0.3 * minmax(similarity(...)) is a weighted sum of normalised scores (+ alone adds raw values).
-- ORDER BY takes arithmetic of scores, numeric fields and numbers: + - * /, ln, log, exp, sqrt, pow, abs, least, greatest, sigmoid, clamp, coalesce, CASE WHEN, minmax(x), rank(x). Example: ORDER BY bm25(body, 'boots') * (1 + 0.2 * coalesce(rating, 0)) DESC. A NULL field makes the expression NULL and the row ranks last.
+- To combine text and vector relevance, prefer a weighted sum of normalised scores: 0.3 * tmm(bm25(...)) + 0.7 * tmm(similarity(...)) (tmm puts each on [0, 1] from its least possible value to its best row's; + alone adds raw values). rrf(score1, score2) fuses two rankings by rank instead; minmax(x) and zscore(x) normalise over the rows ranked.
+- ORDER BY takes arithmetic of scores, numeric fields and numbers: + - * /, ln, log, exp, sqrt, pow, abs, least, greatest, sigmoid, clamp, coalesce, CASE WHEN, tmm(x), minmax(x), zscore(x), rank(x). Example: ORDER BY bm25(body, 'boots') * (1 + 0.2 * coalesce(rating, 0)) DESC. A NULL field makes the expression NULL and the row ranks last.
 - decay(numeric_field, origin, scale) is 1 at the origin and 0.5 at origin ± scale (options: offset => d, decay => 0.5, shape => 'exp' | 'gauss' | 'linear'; origin may be now() for Unix-second timestamps). Multiply to boost relevance: ORDER BY bm25(body, 'boots') * decay(year, 2026, 2) DESC.
 - ORDER BY a numeric field sorts by it (ORDER BY price ASC). score() returns the ranking score.
 - Facets: SELECT f, COUNT(*) FROM {table} WHERE ... GROUP BY f ORDER BY 2 DESC LIMIT 10, where f is a KEYWORD field (or a multi-valued INT field). COUNT(*) alone counts rows.

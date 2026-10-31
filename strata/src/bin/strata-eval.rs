@@ -12,6 +12,12 @@
 //!   chosen on half of the judged queries (dev) and every method is
 //!   reported on the other half (test), with a paired randomization
 //!   p-value against BM25.
+//! * `fusion`: the normalisers of a weighted hybrid side by side: RRF over
+//!   a sweep of its `k`, and `w * norm(bm25) + (1 - w) * norm(similarity)`
+//!   over a sweep of `w` for `minmax`, `tmm` and `zscore`, each family's
+//!   parameter chosen on the dev half and reported on the test half, and
+//!   how much the chosen ranking moves with the depth of the candidates
+//!   (`results/strata/fusion_<tag>.json`).
 //! * `planner`: every filtered query re-run under each forced plan; the
 //!   planner's choice against the best plan in hindsight
 //!   (`results/strata/planner_<tag>.json`).
@@ -305,6 +311,10 @@ fn run_collection(args: &Args, name: &str) -> Result<()> {
         let doc = hybrid_study(args, &sys, &coll)?;
         write_json(&out_dir.join(format!("hybrid{suffix}_{name}.json")), &doc)?;
     }
+    if args.studies.iter().any(|s| s == "fusion") {
+        let doc = fusion_study(args, &sys, &coll)?;
+        write_json(&out_dir.join(format!("fusion{suffix}_{name}.json")), &doc)?;
+    }
     if args.studies.iter().any(|s| s == "showcase") {
         let doc = showcase(&sys, &coll)?;
         write_json(&out_dir.join(format!("showcase{suffix}_{name}.json")), &doc)?;
@@ -428,6 +438,97 @@ fn hybrid_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json>
         "weight_chosen_on_dev": chosen,
         "methods": summary,
         "weighted_exact": exact
+    }))
+}
+
+/// RRF, min-max, theoretical min-max and z-score fusion of BM25 and the
+/// vector ranking, on the same queries: each family's parameter (RRF's
+/// `k`, the others' BM25 weight) chosen on the dev half, every method
+/// reported on the test half, with a paired randomization p-value of each
+/// family's chosen method against RRF at its default `k` (60); and, at the
+/// chosen weight, nDCG@10 and the top 10's overlap with depth 400's when
+/// the candidates are each input's top 20, 100 or 400.
+fn fusion_study(args: &Args, sys: &StrataSys, coll: &Collection) -> Result<Json> {
+    let db = sys.db();
+    let judged: Vec<usize> = (0..coll.queries.len()).filter(|&i| coll.qrels.contains_key(&coll.queries[i].id)).collect();
+    let picked: Vec<usize> = strata::workload::run::spread(judged.len(), args.study_queries).into_iter().map(|j| judged[j]).collect();
+    let bm25 = |depth: usize| format!("bm25(body, '{{t}}', syntax => 'plain', depth => {depth})");
+    let sim = "similarity(emb, :q)";
+    // (family, parameter, ORDER BY at a depth)
+    let mut methods: Vec<(String, f64, Box<dyn Fn(usize) -> String>)> = vec![
+        ("bm25".into(), 0.0, Box::new(move |_| format!("{} DESC", bm25(100)))),
+        ("vector".into(), 0.0, Box::new(move |_| format!("{sim} DESC"))),
+    ];
+    for k in [1.0, 10.0, 20.0, 60.0, 100.0] {
+        methods.push(("rrf".into(), k, Box::new(move |d| format!("rrf(bm25(body, '{{t}}', syntax => 'plain'), {sim}, k => {k}, depth => {d}) DESC"))));
+    }
+    for norm in ["minmax", "tmm", "zscore"] {
+        for w in [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9] {
+            methods.push((norm.into(), w, Box::new(move |d| format!("{w} * {norm}({}) + {:.2} * {norm}({sim}) DESC", bm25(d), 1.0 - w))));
+        }
+    }
+    let name = |(f, p): (&str, f64)| if f == "bm25" || f == "vector" { f.to_string() } else { format!("{f}_{p}") };
+    let run = |order: &str, qi: usize| -> Result<(f64, Vec<String>)> {
+        let q = &coll.queries[qi];
+        let params = Params::new().set("q", Value::Vector(q.vector.clone()));
+        let sql = format!("SELECT id FROM docs ORDER BY {} LIMIT 10", order.replace("{t}", &sql_text(&q.text)));
+        timed(1, || Ok(ids(&db.query(&sql, &params)?.rows)))
+    };
+    let mut ndcg: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut lat: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for &qi in &picked {
+        let judged = &coll.qrels[&coll.queries[qi].id];
+        for (f, p, order) in &methods {
+            let (ms, got) = run(&order(100), qi)?;
+            ndcg.entry(name((f, *p))).or_default().push(ndcg_at_k(&got, judged, 10));
+            lat.entry(name((f, *p))).or_default().push(ms);
+        }
+    }
+    let half = |v: &[f64], r: usize| v.iter().skip(r).step_by(2).copied().collect::<Vec<f64>>();
+    let (dev, test) = (|m: &str| half(&ndcg[m], 0), |m: &str| half(&ndcg[m], 1));
+    let mut families = BTreeMap::new();
+    let mut depth = BTreeMap::new();
+    for fam in ["rrf", "minmax", "tmm", "zscore"] {
+        let ms: Vec<&(String, f64, Box<dyn Fn(usize) -> String>)> = methods.iter().filter(|m| m.0 == fam).collect();
+        let chosen = ms.iter().max_by(|a, b| mean(&dev(&name((&a.0, a.1)))).total_cmp(&mean(&dev(&name((&b.0, b.1)))))).unwrap();
+        let best_test = ms.iter().map(|m| mean(&test(&name((&m.0, m.1))))).fold(f64::NEG_INFINITY, f64::max);
+        let n = name((&chosen.0, chosen.1));
+        families.insert(
+            fam,
+            json!({
+                "chosen_on_dev": chosen.1,
+                "ndcg10": mean(&test(&n)),
+                "best_on_test": best_test,
+                "p_vs_rrf60": paired_randomization(&test(&n), &test("rrf_60"), 10_000, 1),
+                "by_parameter": ms.iter().map(|m| (format!("{}", m.1), json!(mean(&test(&name((&m.0, m.1))))))).collect::<BTreeMap<_, _>>(),
+            }),
+        );
+        if fam == "minmax" || fam == "tmm" || fam == "rrf" {
+            // The chosen ranking at three depths, on the test half.
+            let mut by_depth = BTreeMap::new();
+            let tops: Vec<Vec<Vec<String>>> = [20, 100, 400]
+                .iter()
+                .map(|&d| picked.iter().skip(1).step_by(2).map(|&qi| run(&(chosen.2)(d), qi).map(|r| r.1)).collect::<Result<Vec<_>>>())
+                .collect::<Result<_>>()?;
+            for (i, d) in [20, 100, 400].iter().enumerate() {
+                let nd: Vec<f64> = picked.iter().skip(1).step_by(2).zip(&tops[i]).map(|(&qi, got)| ndcg_at_k(got, &coll.qrels[&coll.queries[qi].id], 10)).collect();
+                let overlap: Vec<f64> = tops[i].iter().zip(&tops[2]).map(|(a, b)| recall(b, a)).collect();
+                by_depth.insert(d.to_string(), json!({"ndcg10": mean(&nd), "top10_overlap_with_depth_400": mean(&overlap)}));
+            }
+            depth.insert(fam, json!(by_depth));
+        }
+    }
+    let summary: BTreeMap<String, Json> = ndcg.keys().map(|m| (m.clone(), json!({"ndcg10": mean(&test(m)), "ndcg10_dev": mean(&dev(m)), "ms_mean": mean(&lat[m])}))).collect();
+    eprintln!(
+        "   fusion (test half): {}",
+        ["bm25", "vector", "rrf_60"].iter().map(|m| format!("{m} {:.3}", mean(&test(m)))).chain(families.iter().map(|(f, v)| format!("{f} {:.3} (at {})", v["ndcg10"].as_f64().unwrap_or(0.0), v["chosen_on_dev"]))).collect::<Vec<_>>().join(", ")
+    );
+    Ok(json!({
+        "collection": coll.name,
+        "queries": {"dev": picked.len().div_ceil(2), "test": picked.len() / 2},
+        "families": families,
+        "depth": depth,
+        "methods": summary,
     }))
 }
 

@@ -340,13 +340,8 @@ impl<'a> Text<'a> {
             Expr::CrossEncoder { model, fields, query, .. } => {
                 format!("cross_encoder({})", std::iter::once(quote(model)).chain(fields.iter().map(|f| field(names, *f))).chain(std::iter::once(quote(query))).collect::<Vec<_>>().join(", "))
             }
-            Expr::Norm { kind, input } => {
-                let name = match kind {
-                    NormKind::MinMax => "minmax",
-                    NormKind::Rank => "rank",
-                };
-                format!("{name}({})", self.expr(input, names))
-            }
+            Expr::Norm { kind: NormKind::Tmm, input, lo: Some(lo) } => format!("tmm({}, lo => {lo})", self.expr(input, names)),
+            Expr::Norm { kind, input, .. } => format!("{}({})", kind.name(), self.expr(input, names)),
             Expr::Match { field: f, query, expand } => format!("MATCH({}, {}{})", field(names, *f), quote(query), expansion(expand)),
             Expr::Graph(g) | Expr::Ppr(g) => self.graph(g, names),
             Expr::Bm25 { field: f, text, opts } => format!("bm25({}, {}{})", field(names, *f), quote(text), options(opts)),

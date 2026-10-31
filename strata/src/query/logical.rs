@@ -367,8 +367,10 @@ pub enum Score {
     /// A numeric function ([`Func::numeric`]).
     Call { func: Func, args: Vec<Score> },
     /// A set function of a ranking expression over the rows it ranks
-    /// (`minmax(x)`, `rank(x)`).
-    Norm { kind: NormKind, input: Box<Score> },
+    /// (`minmax(x)`, `rank(x)`, `tmm(x)`, `zscore(x)`). `lo` is the least
+    /// value `input` can take, which `tmm` reads ([`Score::least`]); `None`
+    /// for the others.
+    Norm { kind: NormKind, input: Box<Score>, lo: Option<f64> },
     /// A ranking model's score of a row from its features
     /// ([`crate::query::model`]): the model named `model`, of the file
     /// whose hash is `hash`, once opened ([`super::ir::Expr::Gbdt`]).
@@ -523,6 +525,27 @@ impl Score {
         matches!(self, Score::Bm25 { .. } | Score::Similarity { .. } | Score::Sparse { .. } | Score::MaxSim { .. } | Score::Ppr { .. } | Score::Hops { .. } | Score::Ranked { .. })
     }
 
+    /// The least value the score can take for any row and query, where it
+    /// has one that does not depend on the data: what `tmm(x)` normalises
+    /// from. BM25, a sparse dot product of the non-negative weights learned
+    /// models give, RRF, personalized PageRank and a decay are at least 0;
+    /// a similarity is a cosine, at least -1, for unit vectors (which an
+    /// embedded field and most models give); maxsim over a list of `n`
+    /// query vectors is at least -1 on a field of one vector a row and -n
+    /// on a multi-vector field, where it sums `n` similarities.
+    pub fn least(&self, schema: &crate::schema::Schema) -> Option<f64> {
+        match self {
+            Score::Bm25 { .. } | Score::Sparse { .. } | Score::Rrf { .. } | Score::Ppr { .. } | Score::Decay { .. } => Some(0.0),
+            Score::Similarity { .. } => Some(-1.0),
+            Score::MaxSim { field, vectors, .. } => match (schema.fields.get(*field).is_some_and(|f| f.multi), vectors) {
+                (false, _) => Some(-1.0),
+                (true, Vectors::List(v)) => Some(-(v.len() as f64)),
+                (true, Vectors::Plan(_)) => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether the score can be a term of the fused shapes
     /// ([`Score::Weighted`], [`Score::Product`]) that came before ranking
     /// expressions: `hops()`, the number of hops in an expression, ranks
@@ -548,7 +571,7 @@ impl Score {
                     (Score::Num(c), x) | (x, Score::Num(c)) => terms(x, w * c, out),
                     _ => false,
                 },
-                Score::Norm { kind: NormKind::MinMax, input } if input.is_fusable() => {
+                Score::Norm { kind: NormKind::MinMax, input, .. } if input.is_fusable() => {
                     out.push((w, (**input).clone()));
                     true
                 }
@@ -600,7 +623,7 @@ impl Score {
             Score::Arith { op, left, right } => Score::Arith { op, left: shapes(left), right: shapes(right) },
             Score::Neg(x) => Score::Neg(shapes(x)),
             Score::Call { func, args } => Score::Call { func, args: args.into_iter().map(Score::fused_shapes).collect() },
-            Score::Norm { kind, input } => Score::Norm { kind, input: shapes(input) },
+            Score::Norm { kind, input, lo } => Score::Norm { kind, input: shapes(input), lo },
             Score::Gbdt { model, hash, args, open } => Score::Gbdt { model, hash, args: args.into_iter().map(Score::fused_shapes).collect(), open },
             Score::Case { whens, otherwise } => Score::Case { whens: whens.into_iter().map(|(c, x)| (c, x.fused_shapes())).collect(), otherwise: otherwise.map(shapes) },
             e => e,

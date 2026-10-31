@@ -62,6 +62,8 @@ const SELECTS: &[&str] = &[
     "SELECT id, seq_no() FROM papers WHERE year > 2000 LIMIT 5",
     "SELECT id FROM papers ORDER BY rrf(bm25(body, 'graph'), similarity(emb, :v), k => 10, depth => 50) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY 0.3 * minmax(bm25(body, 'graph')) + 0.7 * minmax(similarity(emb, :v)) - minmax(rating) DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY 0.3 * tmm(bm25(body, 'graph')) + 0.7 * tmm(similarity(emb, :v)) - 0.1 * tmm(rating, lo => 0) DESC LIMIT 5",
+    "SELECT id FROM papers ORDER BY zscore(bm25(body, 'graph')) + zscore(similarity(emb, :v)) DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY ln(1 + bm25(body, 'graph')) * (1 + 0.2 * coalesce(rating, 0)) - 0.1 * rank(similarity(emb, :v)) + CASE WHEN category = 'ml' THEN 0.5 ELSE -seq_no() / 1e9 END DESC LIMIT 5",
     "SELECT id FROM papers ORDER BY bm25(body, 'graph') * decay(year, 2020, 5) DESC LIMIT 5",
     // A ranking given as keys.
