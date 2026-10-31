@@ -429,7 +429,11 @@ well with plain read-around.
   `ef`, IVF `nprobe` scaled by the same factor, flat: the whole scan), then
   the filter, retried with 4× the candidates if fewer than k members
   survive. Filters correlated *away* from the query need retries (TREC-COVID
-  topic 1%: 9.6 ms vs 1.8 ms for a random 1% filter).
+  topic 1%: 9.6 ms vs 1.8 ms for a random 1% filter). On HNSW a retry goes on
+  with the walk it widens (`hnsw::Walk`, pgvector's iterative scan): the
+  candidates the narrower walk cut, the nodes it scored below its floor and
+  the results it pushed out come back, and the visited set stays, so no node
+  is scored twice. Measured below (post-filter rows).
 * **Auto** asks the cost model for the cheapest applicable strategy: Flat or
   the native index without a filter; PreFilter, the native in-filter
   strategy or PostFilter with one.
@@ -464,6 +468,34 @@ the embedding) Auto makes the same choices; the IVF choice at 3–10% costs
 recall there (TREC-COVID 0.904 / 0.884, Quora 0.918 / 0.936, against 1.000
 for the pre-filter at 1.0–7× the time), because the model cannot see
 correlation.
+
+Resuming the walk, against starting each retry over (TREC-COVID, HNSW at
+ef 64 and rerank 40, 50 queries per cell, the same segment; SQ8 distances
+per query, which do not depend on the machine's load, and mean µs of two
+runs before and two after, on the 4-core cloud container, Intel Xeon @
+2.10 GHz, with nothing else running):
+
+| filter | recall@10 | retries | distances before → after | µs before → after |
+|---|---|---|---|---|
+| topic 1% | 0.984 = | 0.66 = | 52,263 → 37,523 (−28%) | 14,403 / 16,247 → 10,862 / 11,285 |
+| topic 3% | 0.966 = | 0.82 = | 32,631 → 22,646 (−31%) | 9,275 / 8,802 → 7,237 / 7,208 |
+| topic 10% | 0.966 = | 0.66 = | 8,654 → 6,630 (−23%) | 1,647 / 1,635 → 1,398 / 1,438 |
+| topic 30% | 0.996 = | 0.06 = | 1,047 → 993 (−5%) | 187 / 162 → 193 / 180 |
+| random 1–30% | 0.986–0.998 = | ≤ 0.02 = | equal (10%: 2,251 → 2,196) | within noise |
+
+Recall and the number of retries are the same in every cell; only the work
+a retry repeats goes. Growing the walk 2× instead of 4× per retry cuts the
+distances further (topic 3%: 18,106) but loses recall (0.948), because the
+last walk is narrower; 4× stays.
+
+**Lucene's guards on two-hop** (10.2: in-filter two-hop only when the filter
+leaves out at least 40% of the vectors, and from a node look two hops out
+only when more than a tenth of its neighbours fail) were measured on the
+same cells and left out: they give two-hop's recall exactly (topic 1%:
+0.512, 3%: 0.630, 10%: 0.884; random 1%: 0.584), because with filters of
+30% or less nearly every node has more than a tenth of its neighbours
+failing, so the guard always looks two hops out. The planner's choice is
+unchanged: pre-filter below ~3%, post-filter above.
 
 ### Cost model
 

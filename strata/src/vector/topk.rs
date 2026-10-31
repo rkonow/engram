@@ -7,6 +7,7 @@ use crate::segment::{DocFilter, DocId, DocSet};
 
 /// Keeps the `k` best `(score, doc)` pairs by integer SQ8 score; ties go to
 /// the smaller docID so results are deterministic.
+#[derive(Default)]
 pub(crate) struct TopK {
     k: usize,
     heap: BinaryHeap<Reverse<i64>>,
@@ -54,6 +55,35 @@ impl TopK {
             self.heap.pop();
             self.heap.push(Reverse(key));
         }
+    }
+
+    /// [`Self::push`], giving back the pair it does not keep: the one it
+    /// pushed out, or this one.
+    #[inline]
+    pub fn push_out(&mut self, score: i32, doc: DocId) -> Option<(i32, DocId)> {
+        let key = pack(score, doc);
+        if self.heap.len() < self.k {
+            self.heap.push(Reverse(key));
+            None
+        } else if self.k > 0 && key > self.heap.peek().unwrap().0 {
+            let out = self.heap.pop().unwrap().0;
+            self.heap.push(Reverse(key));
+            Some(unpack(out))
+        } else {
+            Some((score, doc))
+        }
+    }
+
+    /// How many it keeps.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Best first, kept.
+    pub fn sorted(&self) -> Vec<(i32, DocId)> {
+        let mut v: Vec<i64> = self.heap.iter().map(|r| r.0).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v.into_iter().map(unpack).collect()
     }
 
     /// Best first.

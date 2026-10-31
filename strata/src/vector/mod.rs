@@ -717,7 +717,8 @@ impl VectorReader {
 
     /// Unfiltered search for `k·margin/s` candidates, then the filter; the
     /// candidate count grows 4× until `k` members survive or every document
-    /// was a candidate.
+    /// was a candidate. An HNSW walk goes on from where it stopped instead of
+    /// starting over (pgvector's iterative scan).
     #[allow(clippy::too_many_arguments)]
     fn post_filter(&self, q: &QueryCode, qf: &[f32], k: usize, r: usize, p: &SearchParams, m: Members, s: f64, stats: &mut SearchStats) -> Vec<(i32, DocId)> {
         let n = self.shape.n;
@@ -725,9 +726,14 @@ impl VectorReader {
         // as they rescore.
         let k = k * self.oversample();
         let mut kp = ((k as f64 * self.cost.post_margin / s).ceil() as usize).max(r).min(n);
+        let mut walk = hnsw::Walk::default();
         loop {
             let cands = match self.info.index.as_str() {
-                "hnsw" => self.hnsw_search(q, p.ef.max(kp), kp, None, stats),
+                "hnsw" => {
+                    let mut c = self.hnsw.as_ref().expect("hnsw").walk(&mut walk, &self.code_rows(), q, p.ef.max(kp), None, false, self.io_hints, stats);
+                    c.truncate(kp);
+                    c
+                }
                 "ivf" => self.ivf.as_ref().expect("ivf").search(q, qf, kp, cost::post_filter_nprobe(p.nprobe, kp, r), None, self.io_hints, stats),
                 _ => self.scan(q, kp, None, stats),
             };

@@ -172,7 +172,7 @@ The binder turns `WHERE` into a predicate tree over text leaves (`MATCH`), struc
 |---|---|
 | none or a column | iterate the filter; top-k heap or column sort |
 | `bm25` | MaxScore or Block-Max WAND over postings, with the filter as a skip constraint |
-| `similarity` | pre-filtered exact scan, IVF with in-filter intersection, HNSW with the filter inside, or post-filtering with oversampling |
+| `similarity` | pre-filtered exact scan, IVF with in-filter intersection, HNSW with the filter inside, or post-filtering with oversampling (too few matches widen an HNSW walk from where it stopped) |
 | fusion | top-*k*′ from each input, union, exact re-scoring of every input on the union; or an exact scan |
 
 ![A filtered hybrid query: each input retrieves its top 100 under the same filter, and the union is re-scored exactly and fused](../assets/img/strata-hybrid-plan.png)

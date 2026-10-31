@@ -461,45 +461,24 @@ impl HnswView {
     /// scored are announced to the kernel first.
     #[allow(clippy::too_many_arguments)]
     pub fn search(&self, codes: &Codes, q: &QueryCode, ef: usize, filter: Option<Members>, two_hop: bool, hints: bool, stats: &mut SearchStats) -> Vec<(i32, DocId)> {
+        self.walk(&mut Walk::default(), codes, q, ef, filter, two_hop, hints, stats)
+    }
+
+    /// [`Self::search`], resumable: called again with the same `walk` and
+    /// query and a larger `ef`, it goes on from where it stopped rather than
+    /// starting over (the candidates it cut and the results it dropped are
+    /// kept), which is what a post-filter needs when too few of the first
+    /// candidates pass (pgvector's iterative scan).
+    #[allow(clippy::too_many_arguments)]
+    pub fn walk(&self, w: &mut Walk, codes: &Codes, q: &QueryCode, ef: usize, filter: Option<Members>, two_hop: bool, hints: bool, stats: &mut SearchStats) -> Vec<(i32, DocId)> {
         if self.entry == NONE || ef == 0 {
             return Vec::new();
         }
-        let mut cur = self.entry;
-        let mut cur_s = q.dot(codes.row(cur));
-        stats.sq8_distances += 1;
         let announce = |ids: &[u32]| {
             if hints {
                 io::will_need(&mut ids.iter().map(|&d| (codes.row(d).as_ptr() as usize, codes.stride())).collect::<Vec<_>>());
             }
         };
-        for l in (1..=self.upper.len()).rev() {
-            loop {
-                let mut changed = false;
-                announce(self.neighbours(cur, l));
-                for &nb in self.neighbours(cur, l) {
-                    let s = q.dot(codes.row(nb));
-                    stats.sq8_distances += 1;
-                    if s > cur_s || (s == cur_s && nb < cur) {
-                        (cur, cur_s) = (nb, s);
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-        }
-
-        let n = codes.n();
-        let mut visited = vec![0u64; n.div_ceil(64)];
-        let seen = |v: &mut Vec<u64>, d: u32| {
-            let (w, b) = (d as usize / 64, d % 64);
-            let was = v[w] >> b & 1 == 1;
-            v[w] |= 1 << b;
-            was
-        };
-        let peek = |v: &Vec<u64>, d: u32| v[d as usize / 64] >> (d % 64) & 1 == 1;
-        let two_hop = two_hop && filter.is_some();
         let is_member = |d: u32, stats: &mut SearchStats| match &filter {
             None => true,
             Some(f) => {
@@ -507,20 +486,70 @@ impl HnswView {
                 f.contains(d)
             }
         };
+        let peek = |v: &Vec<u64>, d: u32| v[d as usize / 64] >> (d % 64) & 1 == 1;
+        let seen = |v: &mut Vec<u64>, d: u32| {
+            let (i, b) = (d as usize / 64, d % 64);
+            let was = v[i] >> b & 1 == 1;
+            v[i] |= 1 << b;
+            was
+        };
         // Candidates: max-heap by (score, smaller docID); results: TopK of members.
         let key = |s: i32, d: u32| ((s as i64) << 32) | (u32::MAX - d) as i64;
-        let mut cand: BinaryHeap<i64> = BinaryHeap::new();
-        let mut res = TopK::new(ef);
-        seen(&mut visited, cur);
-        cand.push(key(cur_s, cur));
-        if is_member(cur, stats) {
-            res.push(cur_s, cur);
+        let unkey = |k: i64| ((k >> 32) as i32, u32::MAX - k as u32);
+        if w.visited.is_empty() {
+            let mut cur = self.entry;
+            let mut cur_s = q.dot(codes.row(cur));
+            stats.sq8_distances += 1;
+            for l in (1..=self.upper.len()).rev() {
+                loop {
+                    let mut changed = false;
+                    announce(self.neighbours(cur, l));
+                    for &nb in self.neighbours(cur, l) {
+                        let s = q.dot(codes.row(nb));
+                        stats.sq8_distances += 1;
+                        if s > cur_s || (s == cur_s && nb < cur) {
+                            (cur, cur_s) = (nb, s);
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+            w.visited = vec![0u64; codes.n().div_ceil(64)];
+            w.res = TopK::new(ef);
+            seen(&mut w.visited, cur);
+            w.cand.push(key(cur_s, cur));
+            if is_member(cur, stats) {
+                w.res.push(cur_s, cur);
+            }
+        } else if ef > w.res.k() {
+            // Wider: the results the narrower walk let go and the nodes it
+            // scored below its floor come back.
+            let mut res = TopK::new(ef);
+            let old: Vec<(i32, u32)> = std::mem::take(&mut w.res).into_sorted().into_iter().chain(std::mem::take(&mut w.evicted).into_iter().map(unkey)).collect();
+            for (s, d) in old {
+                w.evicted.extend(res.push_out(s, d).map(|(s, d)| key(s, d)));
+            }
+            for k in std::mem::take(&mut w.dropped) {
+                let (s, d) = unkey(k);
+                w.cand.push(k);
+                if (two_hop && filter.is_some()) || is_member(d, stats) {
+                    w.evicted.extend(res.push_out(s, d).map(|(s, d)| key(s, d)));
+                }
+            }
+            w.res = res;
         }
+        let (res, cand, visited, dropped, evicted) = (&mut w.res, &mut w.cand, &mut w.visited, &mut w.dropped, &mut w.evicted);
+        let two_hop = two_hop && filter.is_some();
         let mut fresh: Vec<u32> = Vec::with_capacity(self.m0);
         let mut hop2: Vec<u32> = Vec::with_capacity(self.m0);
         while let Some(c) = cand.pop() {
-            let (cs, cd) = ((c >> 32) as i32, u32::MAX - c as u32);
+            let (cs, cd) = unkey(c);
             if res.is_full() && cs < res.floor() {
+                // Kept for a wider walk.
+                cand.push(c);
                 break;
             }
             stats.nodes_visited += 1;
@@ -528,9 +557,9 @@ impl HnswView {
             if two_hop {
                 hop2.clear();
                 for &nb in self.neighbours(cd, 0) {
-                    if !peek(&visited, nb) {
+                    if !peek(visited, nb) {
                         if is_member(nb, stats) {
-                            seen(&mut visited, nb);
+                            seen(visited, nb);
                             fresh.push(nb);
                         } else {
                             hop2.push(nb);
@@ -543,20 +572,20 @@ impl HnswView {
                     if fresh.len() >= self.m0 {
                         break;
                     }
-                    seen(&mut visited, v);
+                    seen(visited, v);
                     for &nb in self.neighbours(v, 0) {
                         if fresh.len() >= self.m0 {
                             break 'look;
                         }
-                        if !peek(&visited, nb) && is_member(nb, stats) {
-                            seen(&mut visited, nb);
+                        if !peek(visited, nb) && is_member(nb, stats) {
+                            seen(visited, nb);
                             fresh.push(nb);
                         }
                     }
                 }
             } else {
                 for &nb in self.neighbours(cd, 0) {
-                    if !seen(&mut visited, nb) {
+                    if !seen(visited, nb) {
                         fresh.push(nb);
                     }
                 }
@@ -582,15 +611,29 @@ impl HnswView {
                     if !res.is_full() || s > res.floor() {
                         cand.push(key(s, nb));
                         if two_hop || is_member(nb, stats) {
-                            res.push(s, nb);
+                            evicted.extend(res.push_out(s, nb).map(|(s, d)| key(s, d)));
                         }
+                    } else {
+                        dropped.push(key(s, nb));
                     }
                 }
                 i += take;
             }
         }
-        res.into_sorted()
+        res.sorted()
     }
+}
+
+/// The state of a resumable walk ([`HnswView::walk`]).
+#[derive(Default)]
+pub(crate) struct Walk {
+    visited: Vec<u64>,
+    cand: BinaryHeap<i64>,
+    res: TopK,
+    /// Nodes scored below the results' floor, neither expanded nor kept.
+    dropped: Vec<i64>,
+    /// Results pushed out of the top `ef` by better ones.
+    evicted: Vec<i64>,
 }
 
 #[cfg(test)]

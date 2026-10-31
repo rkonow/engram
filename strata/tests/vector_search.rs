@@ -260,3 +260,35 @@ fn io_hints_do_not_change_results() {
         }
     }
 }
+
+/// A post-filter whose members lie away from the query (the half of the
+/// vectors least like it) needs many more candidates than its selectivity
+/// says: the HNSW walk widens from where it stopped until enough pass, and
+/// finds the filtered top 10.
+#[test]
+fn post_filter_widens_its_walk() {
+    let dim = 32;
+    let n = 4000;
+    let vecs: Vec<Option<Vec<f32>>> = clustered(n, dim, 8, 21).into_iter().map(Some).collect();
+    let seg = segment(&vecs, dim, &opts("hnsw"));
+    let r = VectorReader::open(&seg, EMB).unwrap();
+    let queries = clustered(10, dim, 8, 22);
+    let (mut found, mut total, mut retried) = (0, 0, 0);
+    for q in &queries {
+        // The half least like the query.
+        let mut by: Vec<(f32, u32)> = vecs.iter().enumerate().map(|(d, v)| (v.as_ref().unwrap().iter().zip(q).map(|(a, b)| a * b).sum::<f32>(), d as u32)).collect();
+        by.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut members: Vec<u32> = by[..n / 2].iter().map(|x| x.1).collect();
+        members.sort_unstable();
+        let f = DocSet::from_sorted(members, n as u32);
+        let truth = naive(&vecs, q, 10, Some(&f));
+        let out = r.search(q, 10, &SearchParams { strategy: Strategy::PostFilter, ..Default::default() }, Some(&f));
+        assert_eq!(out.hits.len(), 10);
+        assert!(out.hits.iter().all(|h| f.contains(h.doc)));
+        retried += (out.stats.retries > 0) as usize;
+        found += out.hits.iter().filter(|h| truth.contains(&h.doc)).count();
+        total += truth.len();
+    }
+    assert_eq!(retried, queries.len(), "every query needs a wider walk");
+    assert!(found as f64 >= 0.9 * total as f64, "post-filter recall {found}/{total}");
+}
