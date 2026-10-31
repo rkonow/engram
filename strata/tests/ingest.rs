@@ -93,7 +93,7 @@ fn files_import_bulk_then_upsert() {
     assert_eq!(ids(&db, "SELECT id FROM products WHERE tags = 'gift'"), ["p1"]);
     assert_eq!(ids(&db, "SELECT id FROM products WHERE MATCH(body, 'steel')"), ["p2"]);
     // The embedded vector was computed from title + description.
-    let q = Params::new().set("q", Value::Vector(HashEmbedder { dim: 16 }.embed_query("blue kettle\nsteel").into()));
+    let q = Params::new().set("q", Value::Vector(HashEmbedder { dim: 16 }.embed_query("blue kettle\nsteel").unwrap().into()));
     assert_eq!(db.query("SELECT id FROM products ORDER BY similarity(emb, :q) DESC LIMIT 1", &q).unwrap().rows[0][0], Value::Str("p2".into()));
 
     // A CSV into a table that has rows: upserts (p2 replaced, p3 new).

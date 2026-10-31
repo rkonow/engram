@@ -42,6 +42,7 @@ pub mod embed;
 pub mod error;
 pub mod forward;
 pub mod graph;
+pub mod hosted;
 pub mod ingest;
 pub mod iostat;
 pub mod media;

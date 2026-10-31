@@ -28,7 +28,7 @@ impl Embedder for Counting {
     fn dim(&self) -> usize {
         DIM
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
         self.1.fetch_add(texts.len(), Ordering::Relaxed);
         self.0.embed(texts)
     }
@@ -68,7 +68,7 @@ fn emb_of(db: &Db, key: &str) -> Option<Vec<f32>> {
 }
 
 fn want(text: &str) -> Vec<f32> {
-    HashEmbedder { dim: DIM }.embed(&[text]).pop().unwrap()
+    HashEmbedder { dim: DIM }.embed(&[text]).unwrap().pop().unwrap()
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn writes_embed_what_they_leave_out() {
     assert_eq!(emb_of(&db, "d0001").unwrap(), vec![1.0; DIM]);
 
     // Text search by meaning finds the rewritten row.
-    let q = Params::new().set("q", Value::Vector(m.embed_query("green teapot\nceramic, large").into()));
+    let q = Params::new().set("q", Value::Vector(m.embed_query("green teapot\nceramic, large").unwrap().into()));
     let r = db.query("SELECT id FROM docs ORDER BY similarity(emb, :q) DESC LIMIT 1", &q).unwrap();
     assert_eq!(r.rows[0][0], Value::Str("d0000".into()));
 
@@ -192,7 +192,7 @@ impl Embedder for Gated {
     fn dim(&self) -> usize {
         DIM
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
         self.texts.fetch_add(texts.len(), Ordering::Relaxed);
         if self.armed.swap(false, Ordering::SeqCst) {
             self.started.lock().unwrap().send(()).unwrap();

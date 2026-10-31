@@ -54,7 +54,7 @@ fn a_store_from_before_field_ids_is_copied_on_first_open() {
     // And its links: the decisions about an entity are one hop in.
     let about = s.query("SELECT text FROM memory WHERE REACHABLE(links, 'e:export', hops => 1, dir => 'in') AND kind = 'decision' ORDER BY seq LIMIT 100").unwrap().rows;
     assert_eq!(about, hits);
-    let v = s.embedder.embed_query("Deploys happen on Tuesdays only (decided in turn 5)");
+    let v = s.embedder.embed_query("Deploys happen on Tuesdays only (decided in turn 5)").unwrap();
     let near = s.query_with("SELECT text FROM memory ORDER BY similarity(emb, :v) DESC LIMIT 1", &Params::new().set("v", Value::Vector(v.into()))).unwrap().rows;
     assert_eq!(near, [vec![Value::Str("Deploys happen on Tuesdays only (decided in turn 5)".into())]]);
     // It takes writes, and is not copied again.

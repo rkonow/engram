@@ -54,7 +54,7 @@ pub fn query(store: &Store, req: &Json) -> Result<Json> {
     if let Some(m) = req.get("embed").and_then(|v| v.as_object()) {
         for (k, v) in m {
             let text = v.as_str().unwrap_or("");
-            params = params.set(k, Value::Vector(store.embedder.embed_query(text).into()));
+            params = params.set(k, Value::Vector(store.embedder.embed_query(text)?.into()));
         }
     }
     let max_dims = req.get("max_dims").and_then(|v| v.as_u64()).map(|n| n as usize);
@@ -96,7 +96,7 @@ pub fn layout(store: &Store) -> Result<Json> {
 /// records to).
 pub fn embed(store: &Store, req: &Json) -> Result<Json> {
     let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    let v = store.embedder.embed_query(text);
+    let v = store.embedder.embed_query(text)?;
     Ok(json!({"embedder": store.embedder.name(), "dim": v.len(), "values": v}))
 }
 

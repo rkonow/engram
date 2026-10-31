@@ -187,7 +187,7 @@ The sources are stored (or generated) `TEXT` or `KEYWORD` fields, and the text e
 
 Several fields can embed different sources side by side, and a query picks one: `ORDER BY similarity(emb_title, :q)`, or both fused, `rrf(similarity(emb_title, :q), similarity(emb_both, :p))`. Each 512-dimension field costs about 0.5 KB a row as 8-bit codes, plus its HNSW graph.
 
-A field may also name a model the server cannot run, such as `cohere/embed-english-v3.0` for vectors computed elsewhere: that documents what the vectors are, writes must supply them, and text cannot be searched against them (only rows, with `vector_of`). The BEIR collections of the evaluation declare their Cohere vectors this way.
+The model can be computed here (the table below) or sit behind an API, such as `openai/text-embedding-3-small` ([hosted models](#hosted-models)). A field may also name a model the server cannot open (its files not fetched, its API key not set): writes must then supply the vectors, and text cannot be searched against them (only rows, with `vector_of`). `/v1/schema` says, for each embedded field, whether its model is open here and why not; `GET /v1/models` lists the models a schema can name and whether each would open on this server.
 
 | model | what it is | |
 |---|---|---|
@@ -204,6 +204,45 @@ A field may also name a model the server cannot run, such as `cohere/embed-engli
 On a Mac, build with `--features accelerate` instead of `bert`: the BERT models' matrix products then run in Apple's Accelerate framework.
 
 `strata-server fetch-model NAME` downloads one of these (or any Hugging Face repository `owner/name` with `config.json`, `tokenizer.json` and `model.safetensors`; CLAP's `pytorch_model.bin`) into the models directory; it also downloads the captioner and the speech model of [text from media](#text-from-media).
+
+### Hosted models
+
+A field can name a model behind an API as `<provider>/<model>`, and Strata calls the provider itself: on every write that leaves the vector out (in batches, before the write queues for the writer, as for a model computed here) and for every `{"embed": "text"}` parameter. Rows go in as plain text and come back by meaning, with no embedding pipeline of your own:
+
+```json
+{"name": "emb", "type": "vector", "embed": {"from": ["title", "description"], "model": "openai/text-embedding-3-small"}}
+```
+
+| provider | names, for example | the key, in the server's environment | base URL (to point at another server of the API) |
+|---|---|---|---|
+| OpenAI | `openai/text-embedding-3-small` (1536), `openai/text-embedding-3-large` (3072) | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
+| Cohere | `cohere/embed-v4.0` (1536), `cohere/embed-english-v3.0` (1024), `cohere/embed-multilingual-v3.0` | `COHERE_API_KEY` or `CO_API_KEY` | `COHERE_BASE_URL` |
+| Voyage AI | `voyage/voyage-3.5` (1024), `voyage/voyage-3-large`, `voyage/voyage-code-3` | `VOYAGE_API_KEY` | `VOYAGE_BASE_URL` |
+| Google Gemini | `gemini/gemini-embedding-001` (3072), `gemini/text-embedding-004` (768) | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `GEMINI_BASE_URL` |
+| Mistral | `mistral/mistral-embed` (1024), `mistral/codestral-embed` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` |
+| Jina AI | `jina/jina-embeddings-v3` (1024), `jina/jina-embeddings-v4` | `JINA_API_KEY` | `JINA_BASE_URL` |
+| Ollama (local) | `ollama/nomic-embed-text` (768), `ollama/mxbai-embed-large` (1024), `ollama/bge-m3` | none | `OLLAMA_HOST` (default `localhost:11434`) |
+
+Any model name after the prefix is sent as it is, so a provider's newer models need no new Strata; a field naming one Strata does not know gives `dim`. Keys are read from the environment when the server opens the model, and never stored in the database or shown in errors: a schema names its model, not its key. Without its key a model does not open, `/v1/schema` says which variable to set, and writes must bring their vectors until it is set. In a cluster, each shard embeds the rows it takes and the coordinator embeds queries, so each needs the key.
+
+What Strata does for each request:
+
+- **Batches** of texts (OpenAI 256 a request, Cohere 96, Gemini 100, Voyage 128, Ollama 32, and by characters too), with up to 4 requests of a model in flight at once across every write and query (2 for Ollama), so a large import runs at the provider's speed and a burst of writes does not trip its rate limit.
+- **Retries** on a rate limit (429, waiting as long as `Retry-After` says), a server error (5xx), a timeout or a dropped connection: six times, waiting half a second and doubling. A refused key (401, 403), a wrong answer (vectors of another size, too few) or a request the API calls bad fails at once. A write whose vectors cannot be had fails whole with 503 (`unavailable: model openai/...: ... answered 429 ...`), and nothing of it is written; a query fails alike.
+- **Long texts** are cut to what the model takes (about 24,000 characters for OpenAI, 8,000 for Gemini; Cohere, Voyage, Jina and Ollama cut them themselves), and a text the API still calls too long is cut by half and sent again.
+- **Documents and queries** are embedded as the API asks: Cohere's `search_document` and `search_query`, Voyage's `document` and `query`, Gemini's `RETRIEVAL_DOCUMENT` and `RETRIEVAL_QUERY`, Jina's `retrieval.passage` and `retrieval.query`, and the prefixes nomic-embed-text, mxbai-embed-large and snowflake-arctic-embed were trained with.
+- **Fewer dimensions.** A field of fewer dimensions than the model makes asks for them, from a model that can shorten its vectors (OpenAI's text-embedding-3, Cohere's embed-v4.0, Voyage 3 and 3.5, Gemini, Jina v3 and v4): `{"type": "vector", "dim": 512, "embed": {"model": "openai/text-embedding-3-large", ...}}` keeps 512 numbers a row. A model that cannot is refused for a field of another size.
+- **Unit vectors and a query cache.** Every vector is normalized, as Strata's dot product needs; the last 4,096 query texts' vectors are kept, so a repeated search sends nothing.
+- **Usage.** `/metrics` counts each field's requests, retries, failures and the tokens the provider says it counted (`strata_embed_requests_total`, `strata_embed_retries_total`, `strata_embed_failures_total`, `strata_embed_tokens_total`), and `/v1/schema` shows them under each embedded field's `usage`.
+
+**Other servers of these APIs.** vLLM, Hugging Face Text Embeddings Inference, LM Studio, LiteLLM, Azure OpenAI, Together and Fireworks speak OpenAI's API. Point `openai/<model>` at one with `OPENAI_BASE_URL` (a server named by URL may need no key), or give it a name of its own: a directory under `--models` holding an `endpoint.json`, which the schema then names like any model.
+
+```json
+{"api": "openai", "base_url": "http://gpu-box:8080/v1", "model": "BAAI/bge-m3", "dim": 1024,
+ "key_env": "GPU_BOX_KEY", "query_prefix": "", "batch": 64, "concurrency": 8}
+```
+
+`api` is `openai`, `cohere`, `voyage`, `gemini`, `jina` or `ollama`. `base_url` gets the API's path added (`/embeddings`); `url` is used as given instead (Azure's `.../deployments/NAME/embeddings?api-version=2024-02-01`, with `"key_header": "api-key"`). The rest are optional: `model` (the API's name; default the directory's), `dim`, `key_env`, `key_header`, `headers` (an object), `document_prefix`, `query_prefix`, `dimensions` (whether the model takes a number of dimensions), `batch`, `batch_chars`, `max_chars`, `concurrency`, `retries` and `timeout_s` (60). An `endpoint.json` in `models/openai/text-embedding-3-small/` changes these for that name only. Strata's builds have hosted models on (feature `hosted`, a default).
 
 **Changing your mind.** Vectors are stored, so changing a field's sources or model means re-embedding. Create a database with the new schema and fill it from the old one:
 
@@ -390,6 +429,7 @@ Every request and answer is JSON. Every answer carries the request's id in an `x
 | `POST /v1/schema/check` | a schema, in either form | `{schema, short, sql}` (`sql` the `CREATE TABLE` that makes it), or the error |
 | `POST /v1/explain` | `{sql, params?, hits?, profile?}` | runs the query and returns its plan IR as JSON (`ir`) and as lines (`tree`, as [`EXPLAIN`](query-language.md#explain) shows it), the executor's plan lines (`plan`), the timed steps of the run (`steps`, its [profile](#what-the-server-is-doing-now)), the bound query (`logical`) and counts; with `hits: n`, a ranked query's top `n` rows as objects with their `score()` and [`features()`](query-language.md#features-the-values-a-ranking-read), the values each was ranked by |
 | `POST /v1/embed` | `{text, image or audio, field?, table?}` | `{table, field, vector}`: the vector of the text, or of the image or sound file (`image` or `audio`, base64, for a model of images or of sound), by an embedded field's model (the first whose model is open, unless `table` and `field` name one), as an `{"embed": text}` parameter gets it; for plans, whose vectors are values |
+| `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name (those Strata fetches, the hosted ones it knows, and the directories of `--models`), and whether each would open here: fetched, its key set, its feature built; nothing is loaded or sent |
 | `GET /v1/media/<sha256>` | | the bytes of the file a row's `media` value names, by the file's SHA-256, read as writes read files (the media store, or a place `--media-fetch` lists) and checked against the hash, so a UI can show it; only files that rows name, 404 otherwise; a coordinator refuses (400): ask a shard server |
 | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | BM25 statistics and a snapshot lease for the query round that follows (it lasts for the deadline and a second), for a coordinator |
 | `POST /v1/sid/next` | `{field, prefixes, where?, params?, table?, timeout_ms?, min_seq_no?, min_seq_nos?}` | the codes that can follow each prefix of a [semantic-ID field](#semantic-ids) among the rows `where` matches: `{next: [{prefix, next: [{code, count}]}], took_ms}` |
@@ -758,6 +798,7 @@ It answers 503 for `down` and `failing`. `/livez` and `/readyz` answer 503 only 
 | `strata_idempotent_replays_total` | | writes answered from their idempotency key instead of being applied again |
 | `strata_slow_requests_total` | `what` | queries and writes the slow log wrote down |
 | `strata_embedded_texts_total`, `strata_embed_duration_seconds` | `for` | texts the server's models embedded for writes and for query parameters, and how long each took |
+| `strata_embed_requests_total`, `strata_embed_retries_total`, `strata_embed_failures_total`, `strata_embed_tokens_total` | `table`, `field`, `model` | requests a [hosted model](#hosted-models) sent, sent again after a rate limit or failure, and failed for good, and the tokens its provider counted |
 | `strata_agent_runs_total` | | questions the agent was asked |
 | `strata_docs`, `strata_segments`, `strata_deleted_docs`, `strata_memtable_docs` | | a database's rows, segments, deleted rows merges have not dropped yet, and rows not yet flushed |
 | `strata_file_bytes`, `strata_free_bytes`, `strata_wal_bytes` | | its size on disk, the free space in its file, and its write-ahead log |

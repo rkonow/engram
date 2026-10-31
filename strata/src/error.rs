@@ -17,6 +17,9 @@ pub enum Error {
     /// A query needed more memory than its budget had left
     /// ([`crate::query::memory`]).
     Memory(String),
+    /// A service Strata calls refused or did not answer: a hosted
+    /// embedding model ([`crate::hosted`]), after its retries.
+    Unavailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -31,6 +34,7 @@ impl fmt::Display for Error {
             Error::Busy(m) => write!(f, "busy: {m}"),
             Error::Timeout(m) => write!(f, "timeout: {m}"),
             Error::Memory(m) => write!(f, "memory: {m}"),
+            Error::Unavailable(m) => write!(f, "unavailable: {m}"),
         }
     }
 }

@@ -140,7 +140,7 @@ fn param(db: &Db, j: &Json) -> strata::Result<Value> {
             };
             let e = db.embedder_in(&s.table, &field).ok_or_else(|| bad(format!("{field} has no embedding model open (see Database.open's models)")))?;
             match &o["embed"] {
-                Json::String(t) => Value::Vector(e.embed_query(t).into()),
+                Json::String(t) => Value::Vector(e.embed_query(t)?.into()),
                 Json::Object(i) if i.len() == 1 && i.values().all(|v| v.is_string()) => {
                     let (kind, b64) = i.iter().next().expect("one key");
                     let (_, data) = strata::embed::query_file(kind, b64.as_str().unwrap_or_default())?;

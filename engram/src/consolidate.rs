@@ -120,7 +120,7 @@ pub fn live_notes(store: &Store, limit: usize) -> Result<Vec<Record>> {
 pub fn groups(store: &Store, notes: &[Record], cfg: &ConsolidateConfig) -> Vec<Vec<usize>> {
     let texts: Vec<String> = notes.iter().map(|r| r.key_text()).collect();
     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-    let vecs = store.embedder.embed(&refs);
+    let Ok(vecs) = store.embedder.embed(&refs) else { return Vec::new() };
     let ents: Vec<HashSet<&str>> = notes.iter().map(|r| r.linked("about").collect()).collect();
     let n = notes.len();
     let mut edges: Vec<(f64, usize, usize)> = Vec::new();

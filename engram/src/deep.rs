@@ -360,14 +360,14 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
                 store.bm25_top(&q.q, n, &f)?.into_iter().map(|x| x.0).collect()
             }
         }
-        "semantic" => store.vector_top(&store.embedder.embed_query(&q.q), n, &f)?.into_iter().map(|x| x.0).collect(),
+        "semantic" => store.vector_top(&store.embedder.embed_query(&q.q)?, n, &f)?.into_iter().map(|x| x.0).collect(),
         "notes" => {
             let p = KnowledgeParams { enabled: true, max_records: n, min_cos: 0.0, min_cov: 0.0, n: n.max(20) };
             recall::knowledge(store, &q.q, filter, &HashSet::new(), &p)?.into_iter().map(|x| x.0).collect()
         }
         "entity" => {
             let text = if q.q.is_empty() { q.names.join(", ") } else { q.q.clone() };
-            let qv = store.embedder.embed_query(&text);
+            let qv = store.embedder.embed_query(&text)?;
             let mut seeds: Vec<String> = Vec::new();
             for name in &q.names {
                 if crate::capture::paths_in(name).first().is_some_and(|p| p == name) {
@@ -375,7 +375,7 @@ pub fn run_query(store: &Store, q: &Query, filter: &Filter, n: usize) -> Result<
                 }
                 seeds.extend(entity_id(name));
                 let ef = Filter { kinds: vec![Kind::Entity], ..Default::default() };
-                for (r, c) in store.vector_top(&store.embedder.embed_query(name), 2, &ef)? {
+                for (r, c) in store.vector_top(&store.embedder.embed_query(name)?, 2, &ef)? {
                     if c >= 0.5 && !seeds.contains(&r.id) {
                         seeds.push(r.id);
                     }
@@ -565,10 +565,10 @@ pub fn features(store: &Store, request: &str, cands: &[Cand]) -> Vec<[f64; 12]> 
     let terms = strata::text::analyze_query(request);
     let idf = if terms.is_empty() { Vec::new() } else { store.idf(&terms).unwrap_or_else(|_| vec![1.0; terms.len()]) };
     let idf_total: f64 = idf.iter().sum();
-    let qv = store.embedder.embed_query(request);
+    let qv = store.embedder.embed_query(request).unwrap_or_else(|_| vec![0.0; store.embedder.dim()]);
     let texts: Vec<String> = cands.iter().map(|c| c.record.embed_text()).collect();
     let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-    let vecs = if refs.is_empty() { Vec::new() } else { store.embedder.embed(&refs) };
+    let vecs = if refs.is_empty() { Vec::new() } else { store.embedder.embed(&refs).unwrap_or_else(|_| vec![vec![0.0; store.embedder.dim()]; refs.len()]) };
     let top = cands.iter().map(|c| c.score).fold(0.0, f64::max);
     let mut seqs: Vec<i64> = cands.iter().map(|c| c.record.seq).collect();
     seqs.sort_unstable();

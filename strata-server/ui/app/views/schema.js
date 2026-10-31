@@ -319,6 +319,34 @@ const TEMPLATES = {
   "Documents": { table: "docs", key: "id", fields: [{ name: "id", type: "keyword" }, { name: "title", type: "text" }, { name: "body", type: "text" }, { name: "source", type: "keyword" }, { name: "published", type: "timestamp" }, { name: "emb", type: "vector", embed: { from: ["title", "body"], model: "potion-retrieval-32M" }, index: "hnsw" }] },
 };
 const MODELS = ["potion-retrieval-32M", "potion-base-8M", "hash:64"];
+// The models a schema can name and whether each opens on this server
+// (GET /v1/models): fetched here, or hosted with its key set.
+let catalogOf = null;
+const modelCatalog = () => (catalogOf ||= api("/v1/models").then((j) => j.models || []).catch(() => []));
+
+// A picker of embedding models: those ready here first, then those that
+// need fetching or a key, each saying so.
+function modelSelect(f, changed) {
+  const sel = h("select", { class: "select sm", onchange: (e) => { f.embed.model = e.target.value; note(); changed(false); } });
+  const hint = h("div", { class: "small muted" });
+  let known = [];
+  const opt = (m) => h("option", { value: m.name, selected: m.name === f.embed.model }, m.name + (m.dim ? ` · ${m.dim}` : "") + (m.hosted ? " · hosted" : ""));
+  const note = () => {
+    const m = known.find((x) => x.name === f.embed.model);
+    hint.textContent = !m ? "" : m.ready ? m.what : `${m.what}. Not ready here: ${m.error}`;
+    hint.className = `small ${m && !m.ready ? "error" : "muted"}`;
+  };
+  const fill = (list) => {
+    known = list.length ? list : MODELS.map((name) => ({ name, ready: true, what: "" }));
+    if (!known.some((m) => m.name === f.embed.model)) known = [{ name: f.embed.model, ready: true, what: "" }, ...known];
+    const ready = known.filter((m) => m.ready), not = known.filter((m) => !m.ready);
+    clear(sel, h("optgroup", { label: "Ready on this server" }, ready.map(opt)), not.length ? h("optgroup", { label: "Needs fetching or an API key" }, not.map(opt)) : null);
+    note();
+  };
+  fill([]);
+  modelCatalog().then(fill);
+  return h("div", { class: "stack", style: { gap: "3px" } }, sel, hint);
+}
 
 function designer(host, bar, { seed, onCreated }) {
   const uid = () => Math.random().toString(36).slice(2, 9);
@@ -457,7 +485,7 @@ function designer(host, bar, { seed, onCreated }) {
       const emb = !!f.embed;
       out.push(lab("Vectors from", "Embed these text fields with a model when rows are written, and text in queries", seg([["model", "a model"], ["given", "the rows"]], emb ? "model" : "given", (v) => { if (v === "model") { f.embed = { from: others((x) => x.type === "text").slice(0, 2), model: MODELS[0] }; delete f.dim; } else { delete f.embed; f.dim = 384; } changed(); })));
       if (emb) {
-        out.push(lab("Model", "Strata knows the dimensions of the models it ships", h("select", { class: "select sm", onchange: (e) => { f.embed.model = e.target.value; changed(false); } }, [...new Set([...MODELS, f.embed.model])].map((x) => h("option", { value: x, selected: x === f.embed.model }, x)))));
+        out.push(lab("Model", "Computed here, or behind an API (OpenAI, Cohere, Voyage, Gemini, Mistral, Jina, Ollama) with its key in the server's environment", modelSelect(f, changed)));
         out.push(lab("Of the fields", "", multiSel(f.embed, "from", others((x) => x.type === "text" || x.type === "keyword"))));
       } else out.push(lab("Dimensions", "", h("input", { class: "input sm num", type: "number", min: 1, value: f.dim || "", style: { width: "90px" }, oninput: (e) => { f.dim = Number(e.target.value) || undefined; changed(false); } })));
       const ix = typeof f.index === "object" ? Object.keys(f.index)[0] : f.index || "hnsw";

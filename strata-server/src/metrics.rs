@@ -172,7 +172,7 @@ pub fn kind(q: &Select) -> &'static str {
 }
 
 /// A label value escaped for the text format.
-fn esc(v: &str) -> String {
+pub fn esc(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 

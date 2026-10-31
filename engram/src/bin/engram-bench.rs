@@ -300,9 +300,9 @@ impl Embedder for CachedOnly {
     fn dim(&self) -> usize {
         self.dim
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
         eprintln!("warning: {} texts missing from the embedding cache", texts.len());
-        texts.iter().map(|_| vec![0f32; self.dim]).collect()
+        Ok(texts.iter().map(|_| vec![0f32; self.dim]).collect())
     }
 }
 
@@ -325,22 +325,22 @@ impl Embedder for CacheEmbedder {
     fn dim(&self) -> usize {
         self.inner.dim()
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
         let c = self.cache.lock().unwrap();
         texts
             .iter()
             .map(|t| match c.get(&embed::fnv(t)) {
-                Some(v) => v.clone(),
+                Some(v) => Ok(v.clone()),
                 None => {
                     self.missing.fetch_add(1, Ordering::Relaxed);
-                    self.inner.embed(&[t]).pop().unwrap()
+                    Ok(self.inner.embed(&[t])?.pop().unwrap_or_default())
                 }
             })
             .collect()
     }
-    fn embed_query(&self, q: &str) -> Vec<f32> {
+    fn embed_query(&self, q: &str) -> strata::Result<Vec<f32>> {
         if let Some(v) = self.cache.lock().unwrap().get(&query_key(q)) {
-            return v.clone();
+            return Ok(v.clone());
         }
         self.missing.fetch_add(1, Ordering::Relaxed);
         self.inner.embed_query(q)
@@ -415,7 +415,7 @@ impl Embeds {
     fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
         let Some(cache) = &self.cache else {
             let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            return self.e.embed(&refs);
+            return self.e.embed(&refs).expect("embedding");
         };
         let keys: Vec<u64> = texts.iter().map(|t| embed::fnv(t)).collect();
         let missing: Vec<usize> = {
@@ -424,7 +424,7 @@ impl Embeds {
         };
         if !missing.is_empty() {
             let refs: Vec<&str> = missing.iter().map(|&i| texts[i].as_str()).collect();
-            let vs = self.e.embed(&refs);
+            let vs = self.e.embed(&refs).expect("embedding");
             let mut c = cache.lock().unwrap();
             for (&i, v) in missing.iter().zip(vs) {
                 c.insert(keys[i], v);
@@ -434,12 +434,12 @@ impl Embeds {
         keys.iter().map(|k| c[k].clone()).collect()
     }
     fn query(&self, q: &str) -> Vec<f32> {
-        let Some(cache) = &self.cache else { return self.e.embed_query(q) };
+        let Some(cache) = &self.cache else { return self.e.embed_query(q).expect("embedding") };
         let k = embed::fnv(&format!("\u{1}query\u{1}{q}"));
         if let Some(v) = cache.lock().unwrap().get(&k) {
             return v.clone();
         }
-        let v = self.e.embed_query(q);
+        let v = self.e.embed_query(q).expect("embedding");
         cache.lock().unwrap().insert(k, v.clone());
         v
     }
@@ -644,7 +644,7 @@ fn main() {
                 let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
                 let embs: Vec<Vec<f32>> = std::thread::scope(|sc| {
                     let parts: Vec<&[&str]> = refs.chunks(refs.len().div_ceil(8).max(1)).collect();
-                    let hs: Vec<_> = parts.into_iter().map(|p| { let e = e.clone(); sc.spawn(move || e.embed(p)) }).collect();
+                    let hs: Vec<_> = parts.into_iter().map(|p| { let e = e.clone(); sc.spawn(move || e.embed(p).expect("embedding")) }).collect();
                     hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
                 });
                 for v in embs {
@@ -659,7 +659,7 @@ fn main() {
             let e = open_embedder(&embedder);
             let t0 = Instant::now();
             for t in &texts {
-                let v = if query { e.embed_query(t) } else { e.embed(&[t.as_str()]).pop().unwrap() };
+                let v = if query { e.embed_query(t).expect("embedding") } else { e.embed(&[t.as_str()]).expect("embedding").pop().unwrap() };
                 println!("{}", serde_json::to_string(&v).unwrap());
             }
             eprintln!("{} texts in {:.1} ms", texts.len(), t0.elapsed().as_secs_f64() * 1e3);
@@ -942,7 +942,7 @@ fn deep_cmd(
                 let recs = records(u, "request");
                 let texts: Vec<String> = recs.iter().map(|r| r.embed_text()).collect();
                 let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                let vecs = e.embed(&refs);
+                let vecs = e.embed(&refs).expect("embedding");
                 let store = Store::open(&tmp.join("m.strata"), e.clone(), StoreOptions { sync: false, flush_docs: usize::MAX / 8, ..Default::default() }).unwrap();
                 store.bulk_insert(&recs, vecs).unwrap();
                 let now = q.question_date.as_deref().map(parse_time).unwrap_or_else(|| recs.iter().map(|r| r.ts).max().unwrap_or(0) + 86_400);
@@ -1121,7 +1121,7 @@ fn probes_cmd(transcript: &Path, probes: &Path, points: &[String], embedder: &st
             let texts: Vec<String> = recs.iter().map(|r| r.embed_text()).collect();
             let t0 = Instant::now();
             let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            let embs = e.embed(&refs);
+            let embs = e.embed(&refs).expect("embedding");
             let embed_s = t0.elapsed().as_secs_f64();
             store.bulk_insert(&recs, embs).unwrap();
             let filter = if fresh { Filter::default() } else { Filter { exclude_window: Some((session.clone(), window_seq)), ..Default::default() } };
@@ -1277,7 +1277,7 @@ fn scale_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queries
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let embs: Vec<Vec<f32>> = std::thread::scope(|s| {
             let chunks: Vec<&[&str]> = refs.chunks((refs.len() / 4).max(1)).collect();
-            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c)) }).collect();
+            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c).expect("embedding")) }).collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         let embed_s = t0.elapsed().as_secs_f64();
@@ -1464,7 +1464,7 @@ fn latency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queri
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let embs: Vec<Vec<f32>> = std::thread::scope(|s| {
             let chunks: Vec<&[&str]> = refs.chunks((refs.len() / 4).max(1)).collect();
-            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c)) }).collect();
+            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c).expect("embedding")) }).collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         drop(texts);
@@ -1497,7 +1497,7 @@ fn latency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queri
             let dir = embed::models_dir().join("potion-retrieval-32M");
             let t = Instant::now();
             let fresh = embed::open("static").unwrap();
-            let _ = fresh.embed_query("warm up the first rows");
+            let _ = fresh.embed_query("warm up the first rows").expect("embedding");
             let open_ms = ms_since(t);
             let t = Instant::now();
             let bytes = std::fs::read(dir.join("model.safetensors")).unwrap();
@@ -1519,7 +1519,7 @@ fn latency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queri
             for (q, _) in qs.iter().cycle().take(qs.len() * 2) {
                 let terms = strata::text::analyze_query(&q.question);
                 let t = Instant::now();
-                let v = store.embedder.embed_query(&q.question);
+                let v = store.embedder.embed_query(&q.question).expect("embedding");
                 ph.entry("embed_query").or_default().push(ms_since(t));
                 let t = Instant::now();
                 let bm = store.bm25_top(&q.question, rank.n, &filter).unwrap();
@@ -1705,7 +1705,7 @@ fn tail_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_queries:
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let embs: Vec<Vec<f32>> = std::thread::scope(|s| {
             let chunks: Vec<&[&str]> = refs.chunks((refs.len() / 4).max(1)).collect();
-            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c)) }).collect();
+            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c).expect("embedding")) }).collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         drop(texts);
@@ -1864,7 +1864,7 @@ fn concurrency_cmd(data: &Path, sizes: &[usize], embedder: &str, out: &Path, n_q
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let embs: Vec<Vec<f32>> = std::thread::scope(|s| {
             let chunks: Vec<&[&str]> = refs.chunks((refs.len() / 4).max(1)).collect();
-            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c)) }).collect();
+            let hs: Vec<_> = chunks.into_iter().map(|c| { let e = e.clone(); s.spawn(move || e.embed(c).expect("embedding")) }).collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         drop(texts);

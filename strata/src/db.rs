@@ -659,7 +659,7 @@ impl Db {
         let mut failed = Vec::new();
         for f in &schema.fields {
             let opened = match (&f.embed, &f.derive) {
-                (Some(spec), _) => crate::embed::open(&spec.model, models).and_then(|m| self.set_embedder_in(table, &f.name, m)),
+                (Some(spec), _) => crate::embed::open_for(&spec.model, match f.ty { FieldType::Vector { dim, .. } => Some(dim), _ => None }, models).and_then(|m| self.set_embedder_in(table, &f.name, m)),
                 (_, Some(spec)) => crate::derive::open(&spec.model, models).and_then(|m| self.set_deriver_in(table, &f.name, m)),
                 _ => continue,
             };
@@ -1462,7 +1462,7 @@ fn vectors_of(models: &[Option<Arc<dyn Embedder>>], schema: &Schema, docs: &[Doc
 /// [`Schema::embed_text`] gives them): of the texts, or of the images or
 /// sounds that the MEDIA values name, decoded a batch at a time.
 fn embed_sources(e: &dyn Embedder, schema: &Schema, f: usize, sources: &[String], files: &Files) -> Result<Vec<Vec<f32>>> {
-    let Some(m) = schema.embeds_media(f) else { return Ok(embed_all(e, sources)) };
+    let Some(m) = schema.embeds_media(f) else { return embed_all(e, sources) };
     if schema.fields[m].media == Some(crate::media::MediaKind::Audio) {
         return in_sound_batches(&schema.fields[m].name, sources, files, |inputs| e.embed_inputs(inputs));
     }
@@ -1744,17 +1744,26 @@ fn not_live(snap: &Snapshot, pk: usize, mut docs: Vec<Document>) -> Vec<Document
     docs
 }
 
-/// `e`'s vectors of `texts`, split across the cores.
-fn embed_all(e: &dyn Embedder, texts: &[String]) -> Vec<Vec<f32>> {
+/// `e`'s vectors of `texts`, split across the cores for a model computed
+/// here ([`Embedder::parallel`]).
+fn embed_all(e: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 64).max(1);
-    if threads == 1 {
-        return e.embed(&refs);
+    let threads = if e.parallel() { std::thread::available_parallelism().map_or(1, |n| n.get()).min(refs.len() / 64).max(1) } else { 1 };
+    let vectors = if threads == 1 {
+        e.embed(&refs)?
+    } else {
+        std::thread::scope(|s| {
+            let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || e.embed(c))).collect();
+            parts.into_iter().map(|p| p.join().expect("embedding thread")).collect::<Result<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    if vectors.len() != texts.len() {
+        return Err(Error::Schema(format!("model {} made {} vectors of {} texts", e.name(), vectors.len(), texts.len())));
     }
-    std::thread::scope(|s| {
-        let parts: Vec<_> = refs.chunks(refs.len().div_ceil(threads)).map(|c| s.spawn(move || e.embed(c))).collect();
-        parts.into_iter().flat_map(|p| p.join().expect("embedding thread")).collect()
-    })
+    Ok(vectors)
 }
 
 fn with_source(mut opts: DbOptions) -> DbOptions {

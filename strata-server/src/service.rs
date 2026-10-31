@@ -825,6 +825,11 @@ impl Service {
         Ok(Arc::new(p))
     }
 
+    /// Where this server's models are: `--models`, else the default.
+    pub fn models_dir(&self) -> std::path::PathBuf {
+        self.models_dir.clone().unwrap_or_else(strata::embed::models_dir)
+    }
+
     /// The embedded fields' models ([`Service::open_models`]).
     pub fn models(&self) -> Arc<Vec<FieldModel>> {
         self.models.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -844,12 +849,16 @@ impl Service {
                     list.push(m.clone());
                     continue;
                 }
+                let dim = match f.ty {
+                    strata::schema::FieldType::Vector { dim, .. } => Some(dim),
+                    _ => None,
+                };
                 let model = match &self.backend {
                     Backend::Local(db) => match db.embedder_in(&t.table, &f.name) {
                         Some(m) => Ok(m),
-                        None => strata::embed::open(&spec.model, dir).and_then(|m| db.set_embedder_in(&t.table, &f.name, m.clone()).map(|_| m)),
+                        None => strata::embed::open_for(&spec.model, dim, dir).and_then(|m| db.set_embedder_in(&t.table, &f.name, m.clone()).map(|_| m)),
                     },
-                    Backend::Cluster(_) => strata::embed::open(&spec.model, dir),
+                    Backend::Cluster(_) => strata::embed::open_for(&spec.model, dim, dir),
                 };
                 list.push(FieldModel { table: t.table.clone(), field: f.name.clone(), spec, model: model.map_err(|e| e.to_string()) });
             }
@@ -1346,7 +1355,7 @@ impl Service {
                         let _core = core;
                         match file {
                             Some((_, data)) => strata::embed::embed_file(e.as_ref(), &data),
-                            None => Ok(e.embed_query(&text)),
+                            None => e.embed_query(&text),
                         }
                     })
                     .await
@@ -2642,6 +2651,21 @@ impl Service {
         ];
         if let Some(s) = &self.log_store {
             more.extend(s.metrics());
+        }
+        // Models behind an API: what each field's model asked of it.
+        let hosted: Vec<(String, strata::embed::Usage)> = self
+            .models()
+            .iter()
+            .filter_map(|m| m.model.as_ref().ok().and_then(|e| e.usage()).map(|u| (format!("table=\"{}\",field=\"{}\",model=\"{}\"", metrics::esc(&m.table), metrics::esc(&m.field), metrics::esc(&m.spec.model)), u)))
+            .collect();
+        if !hosted.is_empty() {
+            let family = |name, help, f: fn(&strata::embed::Usage) -> u64| Family { name, ty: "counter", help, values: hosted.iter().map(|(l, u)| (l.clone(), f(u) as f64)).collect() };
+            more.extend([
+                family("strata_embed_requests_total", "Requests sent to a hosted embedding model, by field.", |u| u.requests),
+                family("strata_embed_retries_total", "Requests to a hosted embedding model sent again after a rate limit or a failure.", |u| u.retries),
+                family("strata_embed_failures_total", "Requests to a hosted embedding model that failed for good, failing their write or query.", |u| u.failures),
+                family("strata_embed_tokens_total", "Tokens a hosted embedding model counted, where its answers say.", |u| u.tokens),
+            ]);
         }
         if let Some(b) = &self.query_memory {
             more.extend([

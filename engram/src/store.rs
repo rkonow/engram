@@ -221,7 +221,7 @@ impl Store {
         }
         let texts: Vec<String> = records.iter().map(|r| r.embed_text()).collect();
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let embs = self.embedder.embed(&refs);
+        let embs = self.embedder.embed(&refs)?;
         self.insert_embedded(records, embs)
     }
 
@@ -283,7 +283,7 @@ impl Store {
         }
         let texts: Vec<String> = records.iter().chain(&entities).map(|r| r.embed_text()).collect();
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let mut embs = self.embedder.embed(&refs).into_iter();
+        let mut embs = self.embedder.embed(&refs)?.into_iter();
         let mut recs: Vec<Pending> = records.into_iter().map(|rec| Pending { rec, emb: embs.next().unwrap_or_default(), how: How::New }).collect();
         recs.extend(entities.into_iter().map(|rec| Pending { rec, emb: embs.next().unwrap_or_default(), how: How::Entity }));
         Ok(self.writer.run(Op::Put(recs))?.stored)
@@ -734,7 +734,7 @@ fn migrate(path: &Path, embedder: &Arc<dyn Embedder>, opts: &StoreOptions) -> Re
         for chunk in records.chunks(4096) {
             let texts: Vec<String> = chunk.iter().map(|r| r.embed_text()).collect();
             let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            new.bulk_insert(chunk, embedder.embed(&refs))?;
+            new.bulk_insert(chunk, embedder.embed(&refs)?)?;
         }
         new.flush()?;
     }
@@ -771,7 +771,7 @@ mod tests {
         // The live window of sess-a (seq >= 2) is excluded.
         let f = Filter { exclude_window: Some(("sess-a".into(), 2)), ..Default::default() };
         assert!(s.bm25_top("planner", 10, &f).unwrap().is_empty());
-        let v = s.embedder.embed_query("vector index HNSW");
+        let v = s.embedder.embed_query("vector index HNSW").unwrap();
         assert_eq!(s.vector_top(&v, 1, &Filter::default()).unwrap()[0].0.kind, Kind::Decision);
         let idf = s.idf(&["planner".into(), "zzz".into()]).unwrap();
         assert!(idf[1] > idf[0]);
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(s.bm25_top("roberto's charger", 5, &only).unwrap().len(), 2);
         let window = Filter { exclude_window: Some((sid.into(), 1)), ..Default::default() };
         assert!(s.bm25_top("charger", 5, &window).unwrap().is_empty());
-        let v = s.embedder.embed_query("charger");
+        let v = s.embedder.embed_query("charger").unwrap();
         assert_eq!(s.vector_top(&v, 5, &window).unwrap().len(), 1);
         let r = Reach { hops: 2, through: crate::recall::THROUGH.to_vec(), max_nodes: 100 };
         let got: Vec<String> = s.reach(&[e], &v, 10, &Filter::default(), &r).unwrap().into_iter().map(|(r, _)| r.id).collect();
@@ -829,7 +829,7 @@ mod tests {
         assert!(s.bm25_top("count sheet", 10, &Filter::default()).unwrap().iter().all(|(r, _)| r.kind != Kind::Entity));
         // From the first note: its source turn (1 hop) and, through the
         // shared entity, the other session's note (2 hops); not the prices.
-        let v = s.embedder.embed_query("count sheet");
+        let v = s.embedder.embed_query("count sheet").unwrap();
         let r = Reach { hops: 2, through: crate::recall::THROUGH.to_vec(), max_nodes: 100 };
         let got: Vec<String> = s.reach(&[todo.clone()], &v, 10, &Filter::default(), &r).unwrap().into_iter().map(|(r, _)| r.id).collect();
         assert!(got.contains(&prompt) && got.contains(&fact_b), "{got:?}");

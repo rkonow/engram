@@ -93,7 +93,7 @@ fn ids(db: &Db, q: &str) -> Vec<String> {
 }
 
 fn vector_of(text: &str) -> Vec<f32> {
-    HashEmbedder { dim: 16 }.embed(&[text]).pop().unwrap()
+    HashEmbedder { dim: 16 }.embed(&[text]).unwrap().pop().unwrap()
 }
 
 #[test]

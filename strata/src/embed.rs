@@ -29,11 +29,12 @@ use crate::error::{Error, Result};
 pub trait Embedder: Send + Sync {
     fn name(&self) -> String;
     fn dim(&self) -> usize;
-    /// Embeddings of documents.
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>>;
+    /// Embeddings of documents, or why the model made none (a model behind
+    /// an API that refused, or did not answer).
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
     /// Embedding of a search query (some models prefix an instruction).
-    fn embed_query(&self, text: &str) -> Vec<f32> {
-        self.embed(&[text]).pop().unwrap()
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(self.embed(&[text])?.pop().unwrap_or_default())
     }
     /// What it embeds: text, and images for a model of both.
     fn modalities(&self) -> &'static [Modality] {
@@ -46,9 +47,33 @@ pub trait Embedder: Send + Sync {
         let texts: Vec<&str> = inputs.iter().filter_map(|i| if let Input::Text(t) = i { Some(*t) } else { None }).collect();
         match inputs.iter().find(|i| !matches!(i, Input::Text(_))) {
             Some(i) => Err(model_err(format!("model {} does not embed {}", self.name(), modality_name(i.modality())))),
-            None => Ok(self.embed(&texts)),
+            None => self.embed(&texts),
         }
     }
+    /// Whether many texts are best split across the cores, as a model
+    /// computed here is; a model behind an API sends its own requests at
+    /// once instead.
+    fn parallel(&self) -> bool {
+        true
+    }
+    /// What a model behind an API has asked of it since it opened.
+    fn usage(&self) -> Option<Usage> {
+        None
+    }
+}
+
+/// The requests a model behind an API sent ([`Embedder::usage`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub requests: u64,
+    /// Requests sent again after a rate limit or a failure.
+    pub retries: u64,
+    /// Requests that failed for good, failing their write or query.
+    pub failures: u64,
+    /// Texts embedded.
+    pub texts: u64,
+    /// Tokens the API counted, where its answers say.
+    pub tokens: u64,
 }
 
 /// A kind of input a model embeds.
@@ -162,7 +187,7 @@ pub fn modality_name(m: Modality) -> &'static str {
     }
 }
 
-fn normalize(v: &mut [f32]) {
+pub(crate) fn normalize(v: &mut [f32]) {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if n > 0.0 {
         v.iter_mut().for_each(|x| *x /= n);
@@ -194,14 +219,99 @@ pub const KNOWN_MODELS: &[(&str, &str, &str)] = &[
     ("clap-htsat-unfused", "laion/clap-htsat-unfused", "CLAP, sound and text, 512 dimensions (feature audio)"),
 ];
 
-/// The dimensions of a model [`open`] knows by name (`hash:N` included),
-/// without opening it.
+/// The dimensions of a model [`open`] knows by name (`hash:N` and hosted
+/// models included, [`crate::hosted::KNOWN`]), without opening it.
 pub fn known_dim(model: &str) -> Option<usize> {
     if let Some(n) = model.strip_prefix("hash:") {
         return n.parse().ok();
     }
-    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("siglip-base-patch16-224", 768), ("clap-htsat-unfused", 512), ("cohere/embed-english-v3.0", 1024)];
+    if let Some(k) = crate::hosted::known_model(model) {
+        return Some(k.dim);
+    }
+    let dims = [("potion-retrieval-32M", 512), ("potion-base-8M", 256), ("bge-small-en-v1.5", 384), ("snowflake-arctic-embed-m-v1.5", 768), ("siglip-base-patch16-224", 768), ("clap-htsat-unfused", 512)];
     dims.iter().find(|(m, _)| m.eq_ignore_ascii_case(model)).map(|&(_, d)| d)
+}
+
+/// A model [`catalog`] lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub name: String,
+    pub dim: Option<usize>,
+    /// Behind an API ([`crate::hosted`]), rather than computed here.
+    pub hosted: bool,
+    pub what: String,
+    /// Whether a field naming it would get its model here, or why not (the
+    /// files not fetched, the key not set, the feature not built).
+    pub ready: std::result::Result<(), String>,
+}
+
+/// The models a schema can name, and whether each would open here: those
+/// Strata fetches ([`KNOWN_MODELS`]), the hosted models it knows
+/// ([`crate::hosted::KNOWN`]), and the other directories of `models` that
+/// hold a model or an `endpoint.json`. Nothing is sent or loaded.
+pub fn catalog(models: &Path) -> Vec<Listed> {
+    let mut out: Vec<Listed> = KNOWN_MODELS
+        .iter()
+        .map(|&(name, _, what)| {
+            let dir = models.join(name);
+            let fetched = model_files(name).iter().all(|f| dir.join(f).exists());
+            let feature = match name {
+                n if n.starts_with("siglip") => (!cfg!(feature = "vision")).then_some("vision"),
+                n if n.starts_with("clap") => (!cfg!(feature = "audio")).then_some("audio"),
+                n if n.starts_with("bge") || n.starts_with("snowflake") => (!cfg!(feature = "bert")).then_some("bert"),
+                _ => None,
+            };
+            let ready = match (feature, fetched) {
+                (Some(f), _) => Err(format!("built without the `{f}` feature")),
+                (None, false) => Err(format!("not fetched: strata-server fetch-model {name}")),
+                (None, true) => Ok(()),
+            };
+            Listed { name: name.into(), dim: known_dim(name), hosted: false, what: what.into(), ready }
+        })
+        .collect();
+    let ready_hosted = |name: &str, config: Option<&serde_json::Value>| -> std::result::Result<(), String> {
+        let ep = crate::hosted::Endpoint::from_config(name, config, &|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+        match cfg!(feature = "hosted") {
+            true => Ok(()),
+            false => Err(format!("a hosted model ({}): build with the `hosted` feature", ep.api.as_str())),
+        }
+    };
+    for k in crate::hosted::KNOWN {
+        let provider = k.name.split('/').next().unwrap_or_default();
+        let config = std::fs::read_to_string(models.join(k.name).join("endpoint.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
+        let what = format!("{provider}, {} dimensions{}", k.dim, if k.shortens { " (or fewer)" } else { "" });
+        out.push(Listed { name: k.name.into(), dim: Some(k.dim), hosted: true, what, ready: ready_hosted(k.name, config.as_ref()) });
+    }
+    // Directories of models, and of endpoints, not listed above.
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(models).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
+        if out.iter().any(|l| l.name.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        let endpoint = dir.join("endpoint.json");
+        if endpoint.exists() {
+            let config = std::fs::read_to_string(&endpoint).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            let dim = config.as_ref().and_then(|c| c.get("dim")).and_then(serde_json::Value::as_u64).map(|d| d as usize);
+            let api = config.as_ref().and_then(|c| c.get("api")).and_then(serde_json::Value::as_str).unwrap_or("?").to_string();
+            let ready = match &config {
+                Some(c) => ready_hosted(&name, Some(c)),
+                None => Err(format!("{}: not JSON", endpoint.display())),
+            };
+            out.push(Listed { name, dim, hosted: true, what: format!("{api} endpoint ({})", endpoint.display()), ready });
+        } else if dir.join("model.safetensors").exists() {
+            let config: serde_json::Value = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            // Ranking models and cross-encoders live here too; only embedders are listed.
+            let kind = config["model_type"].as_str().unwrap_or("model2vec").to_string();
+            if config["architectures"].as_array().is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| s.contains("SequenceClassification")))) {
+                continue;
+            }
+            let dim = config["hidden_size"].as_u64().map(|d| d as usize);
+            out.push(Listed { name, dim, hosted: false, what: format!("{kind} model in {}", dir.display()), ready: Ok(()) });
+        }
+    }
+    out
 }
 
 /// The files the model directory of `name` needs: CLAP's repository
@@ -215,14 +325,42 @@ pub fn model_files(name: &str) -> &'static [&'static str] {
 
 /// Opens the model a schema names: `hash:<dim>`, or a directory under
 /// `models` (or an absolute path) holding a Model2Vec, BERT, SigLIP or
-/// CLAP model ([`model_files`]).
+/// CLAP model ([`model_files`]), or a hosted model ([`crate::hosted`]):
+/// `<provider>/<model>` (`openai/text-embedding-3-small`), or a directory
+/// holding an `endpoint.json`. [`open_for`] opens one for a field's
+/// dimensions.
 pub fn open(model: &str, models: &Path) -> Result<Arc<dyn Embedder>> {
-    if let Some(dim) = model.strip_prefix("hash:") {
-        let dim = dim.parse().map_err(|_| model_err(format!("model {model}: hash:<dimensions>")))?;
-        return Ok(Arc::new(HashEmbedder { dim }));
+    open_for(model, None, models)
+}
+
+/// [`open`], for a field of `dim` dimensions: a hosted model that makes
+/// more, and can make fewer, is asked for `dim`, and one Strata does not
+/// know makes `dim`. A model computed here makes what it makes, which the
+/// field must hold.
+pub fn open_for(model: &str, dim: Option<usize>, models: &Path) -> Result<Arc<dyn Embedder>> {
+    if let Some(d) = model.strip_prefix("hash:") {
+        let d = d.parse().map_err(|_| model_err(format!("model {model}: hash:<dimensions>")))?;
+        return Ok(Arc::new(HashEmbedder { dim: d }));
     }
     let dir = if Path::new(model).is_absolute() { PathBuf::from(model) } else { models.join(model) };
-    if !dir.join("model.safetensors").exists() && !dir.join("pytorch_model.bin").exists() {
+    let endpoint = dir.join("endpoint.json");
+    let has_weights = dir.join("model.safetensors").exists() || dir.join("pytorch_model.bin").exists();
+    if endpoint.exists() || (!has_weights && crate::hosted::is_hosted_name(model)) {
+        let config = match endpoint.exists() {
+            true => {
+                let text = std::fs::read_to_string(&endpoint).map_err(|e| model_err(format!("{}: {e}", endpoint.display())))?;
+                Some(serde_json::from_str::<serde_json::Value>(&text).map_err(|e| model_err(format!("{}: {e}", endpoint.display())))?)
+            }
+            false => None,
+        };
+        let ep = crate::hosted::Endpoint::from_config(model, config.as_ref(), &|k| std::env::var(k).ok())?;
+        #[cfg(feature = "hosted")]
+        return Ok(Arc::new(crate::hosted::HostedEmbedder::new(ep, dim)?));
+        #[cfg(not(feature = "hosted"))]
+        return Err(model_err(format!("model {model} is a hosted model ({}): build with the `hosted` feature", ep.api.as_str())));
+    }
+    let _ = dim;
+    if !has_weights {
         return Err(model_err(format!("model {model}: no {} (fetch it first)", dir.join("model.safetensors").display())));
     }
     let config: serde_json::Value = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
@@ -301,14 +439,14 @@ impl Embedder for StaticEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts
             .iter()
             .map(|t| match self.tokenizer.encode(*t, false) {
                 Ok(e) => self.embed_ids(e.get_ids()),
                 Err(_) => vec![0f32; self.dim],
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -410,8 +548,8 @@ impl Embedder for HashEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts.iter().map(|t| self.of_words(t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()))).collect()
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| self.of_words(t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()))).collect())
     }
     fn modalities(&self) -> &'static [Modality] {
         &[Modality::Text, Modality::Image]
@@ -420,7 +558,7 @@ impl Embedder for HashEmbedder {
         inputs
             .iter()
             .map(|i| match i {
-                Input::Text(t) => Ok(self.embed(&[t]).pop().unwrap()),
+                Input::Text(t) => Ok(self.of_words(t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()))),
                 Input::Image(image) => Ok(self.of_words(Self::colour_words(image).iter().map(String::as_str))),
                 Input::Audio(_) => Err(model_err(format!("model {} does not embed sound", self.name()))),
             })
@@ -471,7 +609,7 @@ impl BertEmbedder {
         Ok(BertEmbedder { model, tokenizer, dim, name })
     }
 
-    fn run(&self, texts: &[String]) -> Vec<Vec<f32>> {
+    fn run(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         use candle_core::Tensor;
         let attempt = || -> std::result::Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
             let enc = self.tokenizer.encode_batch(texts.to_vec(), true).map_err(|e| e.to_string())?;
@@ -487,7 +625,7 @@ impl BertEmbedder {
             v.iter_mut().for_each(|x| normalize(x));
             Ok(v)
         };
-        attempt().unwrap_or_else(|_| texts.iter().map(|_| vec![0f32; self.dim]).collect())
+        attempt().map_err(|e| model_err(format!("{}: {e}", self.name)))
     }
 }
 
@@ -499,21 +637,21 @@ impl Embedder for BertEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         // Batches of similar length waste less on padding.
         let mut order: Vec<usize> = (0..texts.len()).collect();
         order.sort_by_key(|&i| texts[i].len());
         let mut out = vec![Vec::new(); texts.len()];
         for chunk in order.chunks(16) {
             let batch: Vec<String> = chunk.iter().map(|&i| texts[i].to_string()).collect();
-            for (&i, v) in chunk.iter().zip(self.run(&batch)) {
+            for (&i, v) in chunk.iter().zip(self.run(&batch)?) {
                 out[i] = v;
             }
         }
-        out
+        Ok(out)
     }
-    fn embed_query(&self, text: &str) -> Vec<f32> {
-        self.run(&[format!("{}{text}", Self::QUERY_PREFIX)]).pop().unwrap()
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(self.run(&[format!("{}{text}", Self::QUERY_PREFIX)])?.pop().unwrap_or_default())
     }
 }
 
@@ -607,8 +745,12 @@ impl Embedder for SiglipEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts.chunks(32).flat_map(|c| self.texts(c).unwrap_or_else(|_| c.iter().map(|_| vec![0f32; self.dim]).collect())).collect()
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for c in texts.chunks(32) {
+            out.extend(self.texts(c).map_err(|e| model_err(format!("{}: {e}", self.name)))?);
+        }
+        Ok(out)
     }
     fn modalities(&self) -> &'static [Modality] {
         &[Modality::Text, Modality::Image]
@@ -619,7 +761,7 @@ impl Embedder for SiglipEmbedder {
         }
         let texts: Vec<&str> = inputs.iter().filter_map(|i| if let Input::Text(t) = i { Some(*t) } else { None }).collect();
         let images: Vec<&Image> = inputs.iter().filter_map(|i| if let Input::Image(m) = i { Some(*m) } else { None }).collect();
-        let (mut texts, mut images) = (self.embed(&texts).into_iter(), self.images(&images)?.into_iter());
+        let (mut texts, mut images) = (self.embed(&texts)?.into_iter(), self.images(&images)?.into_iter());
         Ok(inputs.iter().map(|i| if let Input::Text(_) = i { texts.next() } else { images.next() }.unwrap_or_default()).collect())
     }
 }

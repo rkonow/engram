@@ -150,7 +150,7 @@ impl Embedder for Words {
     fn dim(&self) -> usize {
         16
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
         HashEmbedder { dim: 16 }.embed(texts)
     }
 }

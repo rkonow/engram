@@ -45,11 +45,16 @@ gemm = { version = "0.19", features = ["x86-v4"], optional = true }
 # Images decoded for SigLIP (`vision`).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"], optional = true }
 # Audio decoded for Whisper (`audio`): WAV, FLAC, MP3, Ogg Vorbis, AAC in MP4.
+# Hosted embedding models (`hosted`): blocking HTTPS, with rustls and ring.
+ureq = { version = "3.5", default-features = false, features = ["rustls"], optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "adpcm", "flac", "mp3", "ogg", "vorbis", "aac", "isomp4"], optional = true }
 
 [features]
-default = ["embed"]
+default = ["embed", "hosted"]
 embed = ["dep:tokenizers"]
+# Embedding models behind an HTTP API: OpenAI, Cohere, Voyage, Gemini,
+# Mistral, Jina, Ollama, and servers of their APIs (`strata::hosted`).
+hosted = ["dep:ureq"]
 bert = ["embed", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:gemm"]
 # Images: decoded with the `image` crate, embedded by SigLIP.
 vision = ["bert", "dep:image"]

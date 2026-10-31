@@ -1499,7 +1499,9 @@ async function refreshHealth() {
 // ---- schema and import ----------------------------------------------------------
 const TYPES = ["text", "keyword", "int", "float", "bool", "timestamp", "vector", "sparse", "media", "edges"];
 const MODELS = { "potion-retrieval-32M": 512, "potion-base-8M": 256, "bge-small-en-v1.5": 384, "snowflake-arctic-embed-m-v1.5": 768 };
-const modelDim = (m) => !m ? null : m.startsWith("hash:") ? Number(m.slice(5)) || null : (MODELS[m] || null);
+// Models behind an API, with the variable holding the key (none for Ollama).
+const HOSTED = { "openai/text-embedding-3-small": [1536, "OPENAI_API_KEY"], "openai/text-embedding-3-large": [3072, "OPENAI_API_KEY"], "cohere/embed-v4.0": [1536, "COHERE_API_KEY"], "voyage/voyage-3.5": [1024, "VOYAGE_API_KEY"], "gemini/gemini-embedding-001": [3072, "GEMINI_API_KEY"], "mistral/mistral-embed": [1024, "MISTRAL_API_KEY"], "jina/jina-embeddings-v3": [1024, "JINA_API_KEY"], "ollama/nomic-embed-text": [768, ""] };
+const modelDim = (m) => !m ? null : m.startsWith("hash:") ? Number(m.slice(5)) || null : (MODELS[m] || (HOSTED[m] && HOSTED[m][0]) || null);
 const FORMATS = { jsonl: "jsonl", ndjson: "jsonl", json: "json", csv: "csv", tsv: "tsv", tab: "tsv" };
 const formatOf = (name) => FORMATS[(name.split(".").pop() || "").toLowerCase()] || "";
 
@@ -1717,9 +1719,9 @@ function fieldRow(f) {
   if (gen) opts.append(el("span", { class: "muted", text: "generated from " + f.from.join(" + ") }));
   if (vec) {
     const m = f.embed && f.embed.model;
-    const names = Object.keys(MODELS);
+    const names = [...Object.keys(MODELS), ...Object.keys(HOSTED)];
     const model = el("select", {}, el("option", { value: "", text: "vectors come with the rows" }),
-      ...names.map((n) => el("option", { value: n, text: `${n} (${MODELS[n]})` })),
+      ...names.map((n) => el("option", { value: n, text: `${n} (${modelDim(n)}${HOSTED[n] ? ", hosted" : ""})` })),
       el("option", { value: m && m.startsWith("hash:") ? m : "hash:64", text: (m && m.startsWith("hash:") ? m : "hash:64") + " (a test model)" }),
       m && !names.includes(m) && !m.startsWith("hash:") ? el("option", { value: m, text: m }) : null);
     model.value = m || "";
@@ -1825,6 +1827,8 @@ function renderCmds() {
   const models = [...new Set(D.fields.map((f) => f.embed && f.embed.model).filter((m) => m && MODELS[m]))];
   const lines = [];
   if (models.length) lines.push("# the embedding models, once", ...models.map((m) => `strata-server fetch-model ${m}`));
+  const keys = [...new Set(D.fields.map((f) => f.embed && HOSTED[f.embed.model] && HOSTED[f.embed.model][1]).filter(Boolean))];
+  if (keys.length) lines.push("# the hosted models' API keys, in the server's environment", ...keys.map((k) => `export ${k}=...`));
   lines.push("# a new database filled from files (JSON Lines, JSON, CSV or TSV)", `strata-server import --db ${db} --schema ${file} rows.jsonl`,
     "# or filled with an existing database's rows (not open in a running server)", `strata-server --db ${db} --schema ${file} --copy-from old.strata`,
     "# then serve it", `strata-server --db ${db}`);

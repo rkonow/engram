@@ -66,8 +66,8 @@ impl Embedder for Tones {
     fn dim(&self) -> usize {
         2
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts.iter().map(|t| at(t.trim_start_matches("tone ").parse().unwrap_or(0.0))).collect()
+    fn embed(&self, texts: &[&str]) -> strata::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| at(t.trim_start_matches("tone ").parse().unwrap_or(0.0))).collect())
     }
     fn modalities(&self) -> &'static [Modality] {
         self.0
@@ -77,7 +77,7 @@ impl Embedder for Tones {
             .iter()
             .map(|i| match i {
                 Input::Audio(a) => at(pitch(a)),
-                Input::Text(t) => self.embed(&[t]).remove(0),
+                Input::Text(t) => self.embed(&[t]).unwrap().remove(0),
                 Input::Image(_) => panic!("tones hears sound and reads text"),
             })
             .collect())
@@ -133,7 +133,7 @@ fn rows_get_the_vectors_of_their_sounds() {
     let (m, data) = strata::embed::query_file("audio", &b64(&wav(870.0, 11_025, 0.5))).unwrap();
     assert_eq!(m, Modality::Audio);
     assert_eq!(nearest(&db, strata::embed::embed_file(e.as_ref(), &data).unwrap()), ["c2", "s"]);
-    assert_eq!(nearest(&db, e.embed_query("tone 1300")), ["c3", "s"]);
+    assert_eq!(nearest(&db, e.embed_query("tone 1300").unwrap()), ["c3", "s"]);
     // A file given as the other kind than it is.
     let png = b"\x89PNG\r\n\x1a\n not really";
     let e = strata::embed::query_file("image", &b64(&data)).unwrap_err().to_string();

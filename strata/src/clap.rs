@@ -155,8 +155,12 @@ impl Embedder for ClapEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
-    fn embed(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts.chunks(32).flat_map(|c| self.texts(c).unwrap_or_else(|_| c.iter().map(|_| vec![0f32; self.dim]).collect())).collect()
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for c in texts.chunks(32) {
+            out.extend(self.texts(c).map_err(|e| model_err(format!("{}: {e}", self.name)))?);
+        }
+        Ok(out)
     }
     fn modalities(&self) -> &'static [Modality] {
         &[Modality::Text, Modality::Audio]
@@ -167,7 +171,7 @@ impl Embedder for ClapEmbedder {
         }
         let texts: Vec<&str> = inputs.iter().filter_map(|i| if let Input::Text(t) = i { Some(*t) } else { None }).collect();
         let sounds: Vec<&Audio> = inputs.iter().filter_map(|i| if let Input::Audio(a) = i { Some(*a) } else { None }).collect();
-        let (mut texts, mut sounds) = (self.embed(&texts).into_iter(), self.sounds(&sounds)?.into_iter());
+        let (mut texts, mut sounds) = (self.embed(&texts)?.into_iter(), self.sounds(&sounds)?.into_iter());
         Ok(inputs.iter().map(|i| if let Input::Text(_) = i { texts.next() } else { sounds.next() }.unwrap_or_default()).collect())
     }
 }

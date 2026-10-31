@@ -254,7 +254,7 @@ fn each_table_embeds_its_own_fields() {
     assert!(db.embedder_in("notes", "emb").is_some());
     assert!(db.embedder("emb").is_none(), "the first table has no such field");
     let h = HashEmbedder { dim: 16 };
-    let vector = |text: &str| Value::Vector(h.embed(&[text]).remove(0).into());
+    let vector = |text: &str| Value::Vector(h.embed(&[text]).unwrap().remove(0).into());
     written(&db, "INSERT INTO notes (id, body) VALUES ('n1', 'graph walks over citations'), ('n2', 'vector search with codes')");
     assert_eq!(rows(&db, "SELECT emb FROM notes WHERE id = 'n1'"), [[vector("graph walks over citations")]]);
     let near = |db: &Db, text: &str| {
@@ -297,5 +297,5 @@ fn each_table_embeds_its_own_fields() {
     written(&db, "CREATE TABLE notes (id KEYWORD PRIMARY KEY, body TEXT, emb VECTOR OPTIONS(embed = 'body', model = 'hash:8'))");
     assert_eq!(db.embedder_in("notes", "emb").map(|e| e.dim()), Some(8));
     written(&db, "INSERT INTO notes (id, body) VALUES ('m', 'short')");
-    assert_eq!(rows(&db, "SELECT emb FROM notes"), [[Value::Vector(HashEmbedder { dim: 8 }.embed(&["short"]).remove(0).into())]]);
+    assert_eq!(rows(&db, "SELECT emb FROM notes"), [[Value::Vector(HashEmbedder { dim: 8 }.embed(&["short"]).unwrap().remove(0).into())]]);
 }

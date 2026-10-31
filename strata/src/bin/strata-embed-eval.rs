@@ -90,7 +90,7 @@ fn main() {
     runs.push(("reference: Cohere embed-english-v3 vector of title + text".into(), "similarity(cohere, :q)".into(), Some("cohere")));
 
     let judged: Vec<_> = coll.queries.iter().filter(|q| coll.qrels.get(&q.id).is_some_and(|j| j.values().any(|&g| g > 0))).collect();
-    let qvecs: Vec<Value> = judged.iter().map(|q| Value::Vector(model.embed_query(&q.text).into())).collect();
+    let qvecs: Vec<Value> = judged.iter().map(|q| Value::Vector(model.embed_query(&q.text).unwrap_or_else(|e| panic!("{e}")).into())).collect();
     let mut rows = Vec::new();
     println!("{:<62} {:>9} {:>11}", format!("{} ({} queries)", coll.name, judged.len()), "nDCG@10", "recall@100");
     for (label, order, vector) in &runs {

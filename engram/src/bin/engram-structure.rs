@@ -831,7 +831,7 @@ fn run_unit(u: &Unit, e: &Arc<dyn Embedder>, lays: &[Layout], press: &[Pres], tm
             })
             .collect();
         let dense: Vec<&str> = rs.iter().map(|r| r.dense.as_str()).collect();
-        let vecs = e.embed(&dense);
+        let vecs = e.embed(&dense).expect("embedding");
         let _ = std::fs::remove_dir_all(tmp);
         std::fs::create_dir_all(tmp).unwrap();
         let store = Store::open(&tmp.join("m.strata"), e.clone(), StoreOptions { vector_index: VectorIndexKind::Flat, sync: false, flush_docs: usize::MAX / 8, ..Default::default() }).unwrap();
@@ -842,7 +842,7 @@ fn run_unit(u: &Unit, e: &Arc<dyn Embedder>, lays: &[Layout], press: &[Pres], tm
             let terms = strata::text::analyze_query(&q.question);
             let tset: HashSet<String> = terms.iter().cloned().collect();
             let bm = if terms.is_empty() { Vec::new() } else { store.bm25_top(&q.question, n, &Filter::default()).unwrap_or_default() };
-            let qv = e.embed_query(&q.question);
+            let qv = e.embed_query(&q.question).expect("embedding");
             let dv = store.vector_top(&qv, n, &Filter::default()).unwrap_or_default();
             let (hits, _) = recall::fuse(&store, &q.question, &terms, bm.clone(), dv.clone(), &hybrid);
             // The hybrid ranking, and on the graph layout each graph variant.
@@ -1117,7 +1117,7 @@ fn transcript_mode(cli: &Cli, e: &Arc<dyn Embedder>) {
                     })
                     .collect();
                 let dense: Vec<&str> = rs.iter().map(|r| r.dense.as_str()).collect();
-                let vecs = e.embed(&dense);
+                let vecs = e.embed(&dense).expect("embedding");
                 let _ = std::fs::remove_dir_all(&tmp);
                 std::fs::create_dir_all(&tmp).unwrap();
                 let store = Store::open(&tmp.join("m.strata"), e.clone(), StoreOptions { vector_index: VectorIndexKind::Flat, sync: false, flush_docs: usize::MAX / 8, ..Default::default() }).unwrap();
@@ -1137,7 +1137,7 @@ fn transcript_mode(cli: &Cli, e: &Arc<dyn Embedder>) {
                         let terms = strata::text::analyze_query(&p.q);
                         let tset: HashSet<String> = terms.iter().cloned().collect();
                         let bm = if terms.is_empty() { Vec::new() } else { store.bm25_top(&p.q, 100, &Filter::default()).unwrap_or_default() };
-                        let dv = store.vector_top(&e.embed_query(&p.q), 100, &Filter::default()).unwrap_or_default();
+                        let dv = store.vector_top(&e.embed_query(&p.q).expect("embedding"), 100, &Filter::default()).unwrap_or_default();
                         let (hits, _) = recall::fuse(&store, &p.q, &terms, bm, dv, &RankParams::default());
                         let first = hits.iter().position(|h| hit(&rs[(h.record.seq - 1) as usize].text));
                         rank1 += (first == Some(0)) as usize;

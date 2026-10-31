@@ -384,8 +384,11 @@ pub fn search_with(store: &Store, query: &str, tail: Option<&Tail>, filter: &Fil
             (bm, td)
         },
         || {
-            let vq = p.use_vectors.then(|| store.embedder.embed_query(query));
-            let dv = vq.as_ref().map_or(Ok(Vec::new()), |v| store.vector_top(v, p.n, filter));
+            let vq = p.use_vectors.then(|| store.embedder.embed_query(query)).transpose();
+            let dv = match &vq {
+                Ok(Some(v)) => store.vector_top(v, p.n, filter),
+                _ => Ok(Vec::new()),
+            };
             let tv = match tail {
                 Some(t) if p.use_vectors => store.maxsim_top(&t.vectors, p.tail.n, filter),
                 _ => Ok(Vec::new()),
@@ -393,7 +396,7 @@ pub fn search_with(store: &Store, query: &str, tail: Option<&Tail>, filter: &Fil
             (vq, dv, tv)
         },
     );
-    let (mut bm, mut dv, mut td, mut tv) = (bm?, dv?, td?, tv?);
+    let (mut bm, mut dv, mut td, mut tv, vq) = (bm?, dv?, td?, tv?, vq?);
     // Earlier copies of the same question and answers that admitted not
     // knowing match a repeated question best and carry nothing: they would
     // inflate the gate and repeat the failure.
@@ -407,7 +410,10 @@ pub fn search_with(store: &Store, query: &str, tail: Option<&Tail>, filter: &Fil
     if !p.graph.enabled || hits.is_empty() {
         return Ok((hits, ev));
     }
-    let qv = vq.unwrap_or_else(|| store.embedder.embed_query(query));
+    let qv = match vq {
+        Some(v) => v,
+        None => store.embedder.embed_query(query)?,
+    };
     let mut graph = expand(store, &qv, &hits, filter, &p.graph)?;
     graph.retain(|(r, _)| useful(r));
     Ok((merge_graph(hits, graph, &p.graph), ev))
@@ -753,7 +759,7 @@ pub fn knowledge(store: &Store, query: &str, filter: &Filter, skip: &HashSet<Str
     let terms = strata::text::analyze_query(query);
     let (bm, dv) = both(
         || if terms.is_empty() { Ok(Vec::new()) } else { store.bm25_top(query, p.n, &f) },
-        || store.vector_top(&store.embedder.embed_query(query), p.n, &f),
+        || store.vector_top(&store.embedder.embed_query(query)?, p.n, &f),
     );
     let mut by: HashMap<String, (Record, f64)> = HashMap::new();
     for (r, c) in dv? {
@@ -791,7 +797,7 @@ pub fn related(store: &Store, text: &str, n: usize) -> Result<Vec<Record>> {
     let live = |r: &Record| r.tag != "superseded" && r.tag != "done" && r.tag != "cue" && (r.kind != Kind::Todo || r.tag == "planned");
     let (bm, dv) = both(
         || if strata::text::analyze_query(text).is_empty() { Ok(Vec::new()) } else { store.bm25_top(text, n * 2, &f) },
-        || store.vector_top(&store.embedder.embed_query(text), n * 2, &f),
+        || store.vector_top(&store.embedder.embed_query(text)?, n * 2, &f),
     );
     let mut score: HashMap<String, (Record, f64)> = HashMap::new();
     for (i, (r, _)) in dv?.into_iter().enumerate() {

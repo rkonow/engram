@@ -19,6 +19,7 @@
 //! | `POST /v1/schema/check` | a schema, in either JSON form | `{schema, short}`, or an error |
 //! | `POST /v1/explain` | `{sql, params?, hits?}` | the bound query, its plan IR and the executor's plan; with `hits`, the top rows with their `score()` and `features()` |
 //! | `POST /v1/embed` | `{text, field?, table?}` | `{table, field, vector}`: the text's vector by an embedded field's model |
+//! | `GET /v1/models` | | `{dir, models: [{name, dim, hosted, what, ready, error}]}`: the embedding models a schema can name, and whether each would open here |
 //! | `GET /v1/media/<sha256>` | | the bytes of the file a row's MEDIA value names, by its hash, read as writes read files (`--media-store`, `--media-fetch`); 404 when no row names it, 400 from a coordinator |
 //! | `GET /v1/synonyms`, `PUT /v1/synonyms` | `{text}` (Solr format) | the synonym list |
 //! | `POST /v1/term_stats` | `{sql, params?, timeout_ms?, min_seq_no?, min_seq_nos?}` | `{stats, snapshot}` |
@@ -141,6 +142,7 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/schema/check", post(schema_check))
         .route("/v1/explain", post(explain))
         .route("/v1/embed", post(embed))
+        .route("/v1/models", get(models))
         .route("/v1/media/:sha256", get(media_file))
         .route("/v1/synonyms", get(synonyms).merge(put(put_synonyms)))
         .route("/v1/term_stats", post(term_stats))
@@ -400,6 +402,8 @@ fn table_json(svc: &crate::service::Service, s: &strata::schema::Schema) -> Json
         "embeddings": svc.models().iter().filter(|m| m.table.eq_ignore_ascii_case(&s.table)).map(|m| json!({
             "field": m.field, "from": m.spec.from, "model": m.spec.model,
             "loaded": m.model.is_ok(), "error": m.model.as_ref().err(),
+            // A model behind an API: the requests it sent.
+            "usage": m.model.as_ref().ok().and_then(|e| e.usage()).map(|u| json!({"requests": u.requests, "retries": u.retries, "failures": u.failures, "texts": u.texts, "tokens": u.tokens})),
         })).collect::<Vec<_>>(),
         // Each derived TEXT field: its MEDIA field, model, and whether this
         // server makes its text (null on a coordinator: its shards do).
@@ -875,6 +879,17 @@ async fn schema_check(AxJson(b): AxJson<Json>) -> Res {
 /// The vector of a text, or of an image or sound file (`"image"` or
 /// `"audio"`, base64), as `{"embed": ...}` gives a query's parameter: for
 /// a plan, whose vectors are values.
+/// The embedding models a schema can name, local and hosted, and whether
+/// each would open on this server ([`strata::embed::catalog`]): fetched,
+/// its key set, its feature built. Nothing is loaded or sent.
+async fn models(State(app): State<App>) -> Res {
+    let dir = app.svc.models_dir();
+    let d = dir.clone();
+    let list = tokio::task::spawn_blocking(move || strata::embed::catalog(&d)).await.map_err(ApiError::internal)?;
+    let models: Vec<Json> = list.iter().map(|m| json!({"name": m.name, "dim": m.dim, "hosted": m.hosted, "what": m.what, "ready": m.ready.is_ok(), "error": m.ready.as_ref().err()})).collect();
+    Ok(AxJson(json!({"dir": dir.display().to_string(), "models": models})))
+}
+
 async fn embed(State(app): State<App>, AxJson(b): AxJson<Json>) -> Res {
     let file = ["image", "audio"].into_iter().find_map(|k| b.get(k).map(|v| (k, v)));
     let what = match file {
