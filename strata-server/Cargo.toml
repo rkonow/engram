@@ -56,7 +56,7 @@ tonic-build = "0.12"
 protox = "0.7"
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 # PNGs written by the tests of `vision`.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
