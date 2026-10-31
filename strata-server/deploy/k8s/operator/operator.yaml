@@ -31,9 +31,11 @@ rules:
   - apiGroups: [apiextensions.k8s.io]
     resources: [customresourcedefinitions]
     verbs: [get, create, patch]
+  # (patch: the coordinators of a cluster may change its sizes, and a Role
+  # grants only what its maker holds.)
   - apiGroups: [strata.chloetech.ai]
     resources: [strataclusters]
-    verbs: [get, list, watch]
+    verbs: [get, list, watch, patch]
   - apiGroups: [strata.chloetech.ai]
     resources: [strataclusters/status]
     verbs: [get, patch, update]
@@ -42,7 +44,11 @@ rules:
     resources: [statefulsets, deployments]
     verbs: [get, list, create, patch, delete]
   - apiGroups: [""]
-    resources: [services, configmaps]
+    resources: [services, configmaps, serviceaccounts]
+    verbs: [get, create, patch]
+  # The coordinators' account, which reads and scales its own cluster.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings]
     verbs: [get, create, patch]
   # Which copies are ready, and the volumes of a shard that left.
   - apiGroups: [""]

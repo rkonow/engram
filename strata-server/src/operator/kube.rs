@@ -13,7 +13,10 @@
 //!   (`data`) of its own, kept when the set is deleted with the cluster
 //!   and deleted when the set shrinks or its shard leaves the cluster;
 //! - `c-coordinator`: the coordinators, a Deployment, behind the Service
-//!   `c` (port 7700: the API and the UI).
+//!   `c` (port 7700: the API and the UI), running as the service account
+//!   `c-coordinator`, which may read and change this one `StrataCluster`
+//!   (a Role and a RoleBinding of the same name): the command center
+//!   shows the cluster's spec and status and scales it ([`Link`]).
 //!
 //! Each is owned by the `StrataCluster`, so deleting it deletes them (the
 //! volumes are kept).
@@ -196,11 +199,32 @@ impl Cluster {
             "apiVersion": "v1", "kind": "Service", "metadata": self.meta(&self.name, self.labels()),
             "spec": {"selector": coord_sel, "ports": [{"name": "http", "port": 7700, "targetPort": 7700}]},
         });
+        // The coordinators' account: this one StrataCluster, read and scaled
+        // from the command center.
+        let account = self.coordinator_account();
+        let sa = json!({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": self.meta(&account, self.labels())});
+        let role = json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "metadata": self.meta(&account, self.labels()),
+            "rules": [{"apiGroups": [GROUP], "resources": [PLURAL], "resourceNames": [self.name], "verbs": ["get", "patch"]}],
+        });
+        let binding = json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding", "metadata": self.meta(&account, self.labels()),
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": account},
+            "subjects": [{"kind": "ServiceAccount", "name": account, "namespace": ns}],
+        });
+        let rbac = |plural: &str| format!("{}/{account}", ns_path(ns, "rbac.authorization.k8s.io/v1", plural));
         vec![
             (format!("{}/{}-schema", ns_path(ns, "v1", "configmaps"), self.name), schema),
             (format!("{}/{}", ns_path(ns, "v1", "services"), self.servers_service()), servers),
             (format!("{}/{}", ns_path(ns, "v1", "services"), self.name), front),
+            (format!("{}/{account}", ns_path(ns, "v1", "serviceaccounts")), sa),
+            (rbac("roles"), role),
+            (rbac("rolebindings"), binding),
         ]
+    }
+
+    fn coordinator_account(&self) -> String {
+        format!("{}-coordinator", self.name)
     }
 
     /// The StatefulSet of shard set `id`, `replicas` copies.
@@ -272,8 +296,10 @@ impl Cluster {
         if s.token_secret.is_none() {
             args.push("--no-token".into());
         }
+        let mut env = self.token_env();
+        env.push(json!({"name": "STRATA_KUBE_CLUSTER", "value": format!("{}/{}", self.ns, self.name)}));
         let mut container = json!({
-            "name": "coordinator", "image": s.image, "args": args, "env": self.token_env(),
+            "name": "coordinator", "image": s.image, "args": args, "env": env,
             "ports": [{"name": "http", "containerPort": 7700}],
             "readinessProbe": {"httpGet": {"path": "/readyz", "port": 7700}, "periodSeconds": 2},
             "livenessProbe": {"httpGet": {"path": "/livez", "port": 7700}, "periodSeconds": 10, "failureThreshold": 6},
@@ -286,7 +312,7 @@ impl Cluster {
         }
         json!({
             "apiVersion": "apps/v1", "kind": "Deployment", "metadata": self.meta(&format!("{}-coordinator", self.name), labels.clone()),
-            "spec": {"replicas": replicas, "selector": {"matchLabels": labels}, "template": {"metadata": {"labels": labels}, "spec": {"containers": [container]}}},
+            "spec": {"replicas": replicas, "selector": {"matchLabels": labels}, "template": {"metadata": {"labels": labels}, "spec": {"serviceAccountName": self.coordinator_account(), "containers": [container]}}},
         })
     }
 
@@ -423,6 +449,70 @@ impl Platform for Cluster {
     }
 }
 
+/// A coordinator's link to the `StrataCluster` that runs it (the
+/// operator names it in `STRATA_KUBE_CLUSTER`, `namespace/name`), through
+/// the API server as the pod's service account: what the command center
+/// shows of it, and the sizes it changes.
+#[derive(Clone)]
+pub struct Link {
+    kube: Kube,
+    pub namespace: String,
+    pub name: String,
+}
+
+impl Link {
+    /// The link to `namespace/name`, in a pod.
+    pub fn new(cluster: &str) -> Result<Link, String> {
+        Link::with(cluster, &Options::default())
+    }
+
+    /// The link to `namespace/name` through the API server `o` names.
+    pub fn with(cluster: &str, o: &Options) -> Result<Link, String> {
+        let (ns, name) = cluster.split_once('/').filter(|(a, b)| !a.is_empty() && !b.is_empty() && !b.contains('/')).ok_or_else(|| format!("a StrataCluster is namespace/name, not {cluster:?}"))?;
+        Ok(Link { kube: Kube::new(o)?, namespace: ns.to_string(), name: name.to_string() })
+    }
+
+    fn path(&self) -> String {
+        format!("/apis/{GROUP}/{VERSION}/namespaces/{}/{PLURAL}/{}", self.namespace, self.name)
+    }
+
+    /// The resource: its spec, its status and whether the operator has
+    /// seen its latest spec.
+    pub async fn get(&self) -> Result<Json, String> {
+        let c = self.kube.get(&self.path()).await?.ok_or_else(|| format!("no StrataCluster {}/{}", self.namespace, self.name))?;
+        let (generation, seen) = (&c["metadata"]["generation"], &c["status"]["observedGeneration"]);
+        Ok(json!({
+            "managed": true, "namespace": self.namespace, "name": self.name, "spec": c["spec"], "status": c["status"],
+            "generation": generation, "settled": !generation.is_null() && generation == seen,
+        }))
+    }
+
+    /// The spec patch that sets `shards`, `replicas` and `coordinators`
+    /// (those given), checked.
+    pub fn sizes(shards: Option<usize>, replicas: Option<usize>, coordinators: Option<usize>) -> Result<Json, String> {
+        let mut spec = serde_json::Map::new();
+        for (k, v, max) in [("shards", shards, crate::slots::SLOTS), ("replicas", replicas, 64), ("coordinators", coordinators, 64)] {
+            if let Some(n) = v {
+                if n == 0 || n > max {
+                    return Err(format!("{k} is 1 to {max}, not {n}"));
+                }
+                spec.insert(k.into(), json!(n));
+            }
+        }
+        if spec.is_empty() {
+            return Err("give shards, replicas or coordinators".into());
+        }
+        Ok(Json::Object(spec))
+    }
+
+    /// Merges `spec` (from [`Link::sizes`]) into the cluster's: the
+    /// operator then takes the cluster there, one step at a time.
+    pub async fn scale(&self, spec: &Json) -> Result<Json, String> {
+        self.kube.merge(&self.path(), &json!({"spec": spec})).await?.ok_or_else(|| format!("no StrataCluster {}/{}", self.namespace, self.name))?;
+        self.get().await
+    }
+}
+
 /// Runs the operator: installs the CRD (with `install_crd`), then looks
 /// at every `StrataCluster` every `every`, takes each one step toward its
 /// spec ([`super::reconcile`]), and writes what it found in its status.
@@ -539,6 +629,29 @@ mod tests {
         let (svc, front) = (&c.common()[1].1, &c.common()[2].1);
         assert_eq!((&svc["spec"]["clusterIP"], &svc["spec"]["publishNotReadyAddresses"]), (&json!("None"), &json!(true)));
         assert_eq!(front["spec"]["selector"]["app.kubernetes.io/component"], "coordinator");
+        // Their account may read and change this cluster, and only it.
+        let spec = &d["spec"]["template"]["spec"];
+        assert_eq!(spec["serviceAccountName"], "orders-coordinator");
+        assert!(spec["containers"][0]["env"].as_array().unwrap().contains(&json!({"name": "STRATA_KUBE_CLUSTER", "value": "db/orders"})));
+        let objects = c.common();
+        let role = &objects.iter().find(|(p, _)| p.ends_with("/roles/orders-coordinator")).unwrap().1;
+        assert_eq!(role["rules"], json!([{"apiGroups": [GROUP], "resources": [PLURAL], "resourceNames": ["orders"], "verbs": ["get", "patch"]}]));
+        let binding = &objects.iter().find(|(p, _)| p.ends_with("/rolebindings/orders-coordinator")).unwrap().1;
+        assert_eq!(binding["subjects"][0], json!({"kind": "ServiceAccount", "name": "orders-coordinator", "namespace": "db"}));
+    }
+
+    #[test]
+    fn a_link_names_one_cluster() {
+        let o = Options { api: Some("http://127.0.0.1:1".into()), ..Default::default() };
+        let l = Link::with("db/orders", &o).unwrap();
+        assert_eq!(l.path(), "/apis/strata.chloetech.ai/v1alpha1/namespaces/db/strataclusters/orders");
+        for bad in ["orders", "/orders", "db/", "a/b/c"] {
+            assert!(Link::with(bad, &o).is_err(), "{bad}");
+        }
+        assert_eq!(Link::sizes(Some(3), None, Some(2)).unwrap(), json!({"shards": 3, "coordinators": 2}));
+        assert!(Link::sizes(None, Some(0), None).unwrap_err().contains("replicas is 1 to 64"));
+        assert!(Link::sizes(Some(5000), None, None).is_err());
+        assert!(Link::sizes(None, None, None).is_err());
     }
 
     #[test]

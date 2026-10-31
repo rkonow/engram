@@ -394,6 +394,23 @@ async fn a_token_guards_the_api() {
     assert_eq!(c.get(format!("{base}/v1/health")).send().await.unwrap().status(), 200);
 }
 
+/// A server the Kubernetes operator does not run says so, and refuses to
+/// scale a StrataCluster; the command center's Cluster view is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_not_run_by_the_operator_has_no_kubernetes_cluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = http(service(create(dir.path(), "k.strata", |i| i < 10), "http://unused"), None).await;
+    let c = reqwest::Client::new();
+    let j: Json = c.get(format!("{base}/v1/kube")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(j, json!({"managed": false}));
+    let (status, j) = post(&c, &format!("{base}/v1/admin/kube"), json!({"shards": 3})).await;
+    assert_eq!(status, 400, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("not run by the Kubernetes operator"), "{j}");
+    let view = c.get(format!("{base}/ui/views/cluster.js")).send().await.unwrap();
+    assert_eq!(view.status(), 200);
+    assert!(view.text().await.unwrap().contains("/v1/admin/kube"));
+}
+
 /// OPS-1: the gRPC port took writes from anyone, a token on HTTP or not.
 /// Every gRPC call now needs the token, and a coordinator sends it.
 #[tokio::test(flavor = "multi_thread")]

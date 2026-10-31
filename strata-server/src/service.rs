@@ -176,6 +176,9 @@ pub struct Service {
     pub schema: Schema,
     pub metrics: Metrics,
     pub agent: AgentConfig,
+    /// The `StrataCluster` that runs this coordinator on Kubernetes, if one
+    /// does ([`crate::operator::kube::Link`]).
+    pub kube: Option<crate::operator::kube::Link>,
     /// The queries running now ([`telemetry::LiveQueries`]).
     pub live: Arc<LiveQueries>,
     /// The latest and slow queries, and statistics per statement.
@@ -318,6 +321,7 @@ impl Service {
             schema,
             metrics: Metrics::default(),
             agent,
+            kube: None,
             live: Arc::new(LiveQueries::default()),
             query_log: QueryLog::default(),
             series: Series::default(),

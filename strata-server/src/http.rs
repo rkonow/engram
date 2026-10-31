@@ -182,6 +182,8 @@ pub fn router(svc: Arc<Service>, access: &Access) -> Router {
         .route("/v1/logs/store", get(log_store))
         .route("/v1/system", get(system))
         .route("/v1/cluster", get(cluster))
+        .route("/v1/kube", get(kube))
+        .route("/v1/admin/kube", post(kube_scale))
         .route("/v1/routes", get(routes))
         .route("/v1/whoami", get(whoami))
         .route("/v1/admin/keys", get(list_keys).merge(post(create_key)))
@@ -1411,6 +1413,30 @@ async fn system(State(app): State<App>) -> AxJson<Json> {
 
 async fn cluster(State(app): State<App>) -> AxJson<Json> {
     AxJson(app.svc.cluster().await)
+}
+
+/// `GET /v1/kube`: the `StrataCluster` that runs this coordinator on
+/// Kubernetes (its spec, and the operator's status), or `managed: false`.
+async fn kube(State(app): State<App>) -> Res {
+    match &app.svc.kube {
+        None => Ok(AxJson(json!({"managed": false}))),
+        Some(l) => l.get().await.map(AxJson).map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") }),
+    }
+}
+
+/// `POST /v1/admin/kube {"shards"?, "replicas"?, "coordinators"?}`:
+/// changes the `StrataCluster`'s sizes; the operator then makes the change.
+async fn kube_scale(State(app): State<App>, AxJson(b): AxJson<Json>) -> Result<Response, ApiError> {
+    let l = app.svc.kube.as_ref().ok_or_else(|| ApiError::bad("this coordinator is not run by the Kubernetes operator: change the cluster with /v1/admin/shards"))?;
+    let n = |k: &str| match b.get(k) {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| ApiError::bad(format!("{k} is a number"))),
+    };
+    let (shards, replicas, coordinators) = (n("shards")?, n("replicas")?, n("coordinators")?);
+    let spec = crate::operator::kube::Link::sizes(shards, replicas, coordinators).map_err(ApiError::bad)?;
+    let j = l.scale(&spec).await.map_err(|e| ApiError { status: 502, message: format!("the Kubernetes API: {e}") })?;
+    let said: Vec<String> = [("shards", shards), ("copies per shard", replicas), ("coordinators", coordinators)].iter().filter_map(|(k, v)| v.map(|v| format!("{v} {k}"))).collect();
+    Ok(audited(j, format!("asked the operator for {} ({}/{})", said.join(", "), l.namespace, l.name)))
 }
 
 async fn routes(State(app): State<App>) -> AxJson<Json> {

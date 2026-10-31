@@ -15,7 +15,7 @@ replicas dies, how to move to more shards, and what network latency does.
 | `k8s/shards.yaml` | a set of N shards × R replicas: a headless Service, and per shard a StatefulSet of R pods on different nodes; replica r of shard i serves `/data/<collection>.shard<i>of<N>.strata` (r = 0) or its own copy `...shard<i>of<N>.r<r>.strata` |
 | `k8s/coordinator.yaml` | the coordinator, a Deployment pointed at one set of shards (`--shards`, replicas of a shard joined by `\|`) |
 | `k8s/single.yaml` | one database holding the whole collection, to compare answers and latency with |
-| `k8s/operator/operator.yaml` | the operator: its namespace (`strata-system`), service account, cluster role and Deployment |
+| `k8s/operator/operator.yaml` | the operator: its namespace (`strata-system`), service account, cluster role (which includes making each cluster's Role for its coordinators) and Deployment |
 | `k8s/operator/crd.json` | the `StrataCluster` resource definition, which the operator installs when it starts (`strata-server operator --print-crd` writes it) |
 | `k8s/operator/cluster.yaml` | a cluster for it to make: 2 shards of 3 copies, 10,000 demo products |
 | `kind-test.sh` | creates the kind cluster and runs each step below |
@@ -67,6 +67,13 @@ What a change does:
 - The coordinators' `--shards` list follows the cluster's servers, so that
   a coordinator that starts again finds the cluster; their number follows
   `coordinators`.
+
+The coordinators run as the service account `<cluster>-coordinator`, which
+a Role lets read and patch their own `StrataCluster` and nothing else: the
+command center's **Cluster** view (`kubectl -n strata port-forward svc/demo
+7700`, then `http://127.0.0.1:7700/#/cluster`) shows the operator's phase
+and message and changes the shards, copies per shard and coordinators,
+which the operator then makes as above.
 
 The operator does not choose primaries: the copies of a shard elect one
 among themselves ([failover](../../docs/strata/server.md#failover)), so a

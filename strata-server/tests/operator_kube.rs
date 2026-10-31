@@ -3,8 +3,8 @@
 //! no pods run, and the test stands in for the kubelet by marking pods
 //! ready). It installs the resource definition, makes a cluster's objects,
 //! which the API server validates, writes the cluster's status, starts
-//! the coordinator once the shards' first copies are ready, and scales
-//! and deletes a set.
+//! the coordinator once the shards' first copies are ready, scales and
+//! deletes a set, and reads and scales the cluster as a coordinator does.
 //!
 //! Skipped unless `STRATA_ENVTEST_DIR` names a directory holding `etcd`
 //! and `kube-apiserver` (for example from `setup-envtest use`, or etcd
@@ -159,6 +159,12 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     let svc = get(&k, "/api/v1/namespaces/db/services/orders-servers").await;
     assert_eq!((&svc["spec"]["clusterIP"], &svc["spec"]["publishNotReadyAddresses"]), (&json!("None"), &json!(true)));
     assert_eq!(get(&k, "/api/v1/namespaces/db/services/orders").await["spec"]["ports"][0]["port"], 7700);
+    // The coordinators' account, which may read and scale this cluster.
+    let role = get(&k, "/apis/rbac.authorization.k8s.io/v1/namespaces/db/roles/orders-coordinator").await;
+    assert_eq!(role["rules"][0]["resourceNames"], json!(["orders"]), "{role}");
+    let binding = get(&k, "/apis/rbac.authorization.k8s.io/v1/namespaces/db/rolebindings/orders-coordinator").await;
+    assert_eq!(binding["subjects"][0]["name"], "orders-coordinator");
+    assert_eq!(get(&k, "/api/v1/namespaces/db/serviceaccounts/orders-coordinator").await["metadata"]["name"], "orders-coordinator");
     let schema = get(&k, "/api/v1/namespaces/db/configmaps/orders-schema").await;
     strata::schema::Schema::from_json(schema["data"]["schema.json"].as_str().unwrap()).unwrap();
     assert_eq!(now().await["status"]["phase"], "Creating");
@@ -177,6 +183,7 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     let d = get(&k, "/apis/apps/v1/namespaces/db/deployments/orders-coordinator").await;
     let args = &d["spec"]["template"]["spec"]["containers"][0]["args"];
     assert_eq!(args[1], "http://orders-s0-0.orders-servers.db.svc:7701,http://orders-s1-0.orders-servers.db.svc:7701", "{d}");
+    assert_eq!(d["spec"]["template"]["spec"]["serviceAccountName"], "orders-coordinator");
     // Its Service's name does not resolve here: the operator waits.
     let out = kube::once(&k, &now().await).await;
     assert!(out.phase == Phase::Creating && out.message.starts_with("waiting for the coordinator"), "{out:?}");
@@ -200,6 +207,17 @@ async fn the_operator_makes_a_clusters_objects_on_an_api_server() {
     // (No controller manager removes a claim's protection finalizer here.)
     let p = k.get("/api/v1/namespaces/db/persistentvolumeclaims/data-orders-s1-0").await.unwrap();
     assert!(p.is_none() || !p.unwrap()["metadata"]["deletionTimestamp"].is_null(), "the set's volume is deleted");
+
+    // What the coordinator shows of its cluster, and the sizes it changes.
+    let link = kube::Link::with("db/orders", &kube::Options { api: Some(env.url.clone()), token: Some(TOKEN.into()), ca: Some(env.ca.clone()), ..Default::default() }).unwrap();
+    let j = link.get().await.unwrap();
+    assert_eq!((&j["spec"]["shards"], &j["status"]["phase"], &j["settled"]), (&json!(2), &json!("Creating"), &json!(true)), "{j}");
+    let j = link.scale(&kube::Link::sizes(Some(3), Some(2), None).unwrap()).await.unwrap();
+    assert_eq!((&j["spec"]["shards"], &j["spec"]["replicas"], &j["spec"]["demo"], &j["settled"]), (&json!(3), &json!(2), &json!(300), &json!(false)), "{j}");
+    kube::once(&k, &now().await).await;
+    assert_eq!(link.get().await.unwrap()["settled"], true);
+    let gone = kube::Link::with("db/nothing", &kube::Options { api: Some(env.url.clone()), token: Some(TOKEN.into()), ca: Some(env.ca.clone()), ..Default::default() }).unwrap();
+    assert!(gone.get().await.unwrap_err().contains("no StrataCluster db/nothing"));
 
     // A spec that the definition allows but the operator does not.
     k.merge(&format!("{CLUSTERS}/orders"), &json!({"spec": {"schema": {"table": "t", "fields": []}}})).await.unwrap();

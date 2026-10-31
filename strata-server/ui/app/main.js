@@ -195,12 +195,12 @@ function openPalette() {
 }
 
 function shortcuts() {
-  const rows = [["Ctrl K, /", "Search views and actions"], ["g then o", "Overview"], ["g then t", "Topology"], ["g then p", "Performance"], ["g then q", "Queries"], ["g then l", "Logs"], ["g then a", "Alerts"], ["g then k", "Access"], ["g then s", "System"], ["p", "Pause or resume"], ["t", "Light or dark"], ["[", "Collapse the sidebar"], ["Esc", "Close a panel"]];
+  const rows = [["Ctrl K, /", "Search views and actions"], ["g then o", "Overview"], ["g then t", "Topology"], ["g then c", "Cluster"], ["g then p", "Performance"], ["g then q", "Queries"], ["g then l", "Logs"], ["g then a", "Alerts"], ["g then k", "Access"], ["g then s", "System"], ["p", "Pause or resume"], ["t", "Light or dark"], ["[", "Collapse the sidebar"], ["Esc", "Close a panel"]];
   modal({ title: "Keyboard shortcuts", body: h("dl", { class: "kv" }, rows.flatMap(([k, v]) => [h("dt", {}, k.split(", ").map((x, i) => [i ? " or " : "", ...x.split(" then ").map((y, j) => [j ? " then " : "", h("kbd", {}, y)])])), h("dd", {}, v)])) });
 }
 
 let gPending = 0;
-const G = { o: "overview", t: "topology", p: "performance", q: "queries", l: "logs", a: "alerts", k: "access", s: "system", w: "sql", b: "builder", d: "schema", i: "import", r: "relevance" };
+const G = { o: "overview", t: "topology", c: "cluster", p: "performance", q: "queries", l: "logs", a: "alerts", k: "access", s: "system", w: "sql", b: "builder", d: "schema", i: "import", r: "relevance" };
 document.addEventListener("keydown", (e) => {
   const typing = e.target.closest?.("input,textarea,select,[contenteditable=true]");
   if ((e.key === "k" || e.key === "K") && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openPalette(); return; }

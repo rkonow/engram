@@ -32,6 +32,7 @@ pub const FILES: &[(&str, &str, &str)] = &[
     ("views/index.js", JS, include_str!("../ui/app/views/index.js")),
     ("views/overview.js", JS, include_str!("../ui/app/views/overview.js")),
     ("views/topology.js", JS, include_str!("../ui/app/views/topology.js")),
+    ("views/cluster.js", JS, include_str!("../ui/app/views/cluster.js")),
     ("views/performance.js", JS, include_str!("../ui/app/views/performance.js")),
     ("views/alerts.js", JS, include_str!("../ui/app/views/alerts.js")),
     ("views/queries.js", JS, include_str!("../ui/app/views/queries.js")),

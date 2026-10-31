@@ -136,6 +136,11 @@ struct Args {
     /// flagged "partial" (a request's "partial" overrides it).
     #[arg(long)]
     partial: bool,
+    /// With --shards: the StrataCluster (namespace/name) that runs this
+    /// coordinator on Kubernetes, read and scaled through the API server as
+    /// the pod's service account (the operator sets it).
+    #[arg(long, env = "STRATA_KUBE_CLUSTER")]
+    kube_cluster: Option<String>,
     /// HTTP address (API, metrics, UI).
     #[arg(long, default_value = "127.0.0.1:7700")]
     listen: String,
@@ -580,6 +585,7 @@ async fn main() {
         verify_every_s: a.verify_every_s,
         failover_after_ms: a.failover_after_ms,
         shards: a.shards,
+        kube_cluster: a.kube_cluster.filter(|c| !c.is_empty()),
         coord: strata_server::coord::CoordOptions {
             hedge: std::time::Duration::from_millis(a.hedge_ms),
             shard_timeout: (a.shard_timeout_ms > 0).then(|| std::time::Duration::from_millis(a.shard_timeout_ms)),

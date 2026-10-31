@@ -73,6 +73,9 @@ pub struct Options {
     /// joined by `|`) instead of serving a database.
     pub shards: Vec<String>,
     pub coord: CoordOptions,
+    /// With `shards`: the `StrataCluster` (`namespace/name`) that runs this
+    /// coordinator on Kubernetes, which the command center shows and scales.
+    pub kube_cluster: Option<String>,
     pub timeout_ms: u64,
     /// The longest deadline a request may ask for (0: the larger of
     /// `timeout_ms` and 60 s).
@@ -280,6 +283,15 @@ pub async fn service(o: &Options) -> Result<Arc<Service>, String> {
         svc.keep_slots_in(path)?;
         if let Some((m, shard)) = svc.slots() {
             tracing::info!(epoch = m.epoch, shard, of = m.shards(), "holds slots");
+        }
+    }
+    if let Some(c) = o.kube_cluster.as_deref().filter(|_| !o.shards.is_empty()) {
+        match crate::operator::kube::Link::new(c) {
+            Ok(l) => {
+                tracing::info!(cluster = %c, "run by the Kubernetes operator: the command center shows and scales the StrataCluster");
+                svc.kube = Some(l);
+            }
+            Err(e) => tracing::warn!(cluster = %c, error = %e, "cannot reach the StrataCluster that runs this coordinator"),
         }
     }
     if o.max_timeout_ms > 0 {
